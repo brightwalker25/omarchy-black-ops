@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# Black Ops software watch: the program the pacman hook runs as root after a
+# transaction. pacman passes the names of the packages it installed or
+# upgraded on standard input, one per line. This writes those names, and
+# nothing else, to a spool file that the user's watch reads later:
+#
+#   /var/lib/omarchy-black-ops/pending/<epoch>-<pid>.list   (mode 0644)
+#
+# It removes spool files older than 30 days. It never fails the
+# transaction: any error is printed and it exits 0. It reads no other file
+# and runs no other program than the few shell tools below.
+
+umask 022
+PATH=/usr/bin:/bin
+export PATH
+
+dir=/var/lib/omarchy-black-ops/pending
+# The tests run this as an ordinary account in a sandbox. As root the
+# environment is never consulted.
+if [ "$(id -u)" -ne 0 ] && [ -n "${BLACK_OPS_VAR:-}" ]; then
+  dir="$BLACK_OPS_VAR/lib/omarchy-black-ops/pending"
+fi
+
+spool() {
+  mkdir -p "$dir" || return 1
+  chmod 0755 "$dir" || return 1
+  stamp=$(date +%s) || return 1
+  tmp="$dir/.$stamp-$$.tmp"
+  : >"$tmp" || return 1
+  count=0
+  while IFS= read -r name; do
+    case $name in
+      '' | *[!A-Za-z0-9@._+-]*) continue ;;
+    esac
+    printf '%s\n' "$name" >>"$tmp" || return 1
+    count=$((count + 1))
+  done
+  if [ "$count" -eq 0 ]; then
+    rm -f "$tmp"
+  else
+    chmod 0644 "$tmp" && mv -f "$tmp" "$dir/$stamp-$$.list" || return 1
+  fi
+  find "$dir" -maxdepth 1 -type f -name '*.list' -mtime +30 -exec rm -f {} + 2>/dev/null
+  find "$dir" -maxdepth 1 -type f -name '.*.tmp' -mmin +60 -exec rm -f {} + 2>/dev/null
+  return 0
+}
+
+if ! spool; then
+  echo "Black Ops: could not note the changed packages for the software watch; the daily scan will find them." >&2
+  rm -f "${tmp:-}" 2>/dev/null
+fi
+exit 0

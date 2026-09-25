@@ -1,0 +1,75 @@
+# Installed by bin/black-ops-install for the Black Ops bar plugin, and left
+# disabled. The listen row in the panel starts and stops it through the root
+# helper. docs/listen.md describes what it records and where.
+
+[Unit]
+Description=Black Ops listen mode: which program contacts which host, kept in RAM
+After=systemd-resolved.service
+ConditionPathExists=/usr/local/lib/omarchy-black-ops/listen
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/lib/omarchy-black-ops/listen
+Restart=on-failure
+RestartSec=10
+
+RuntimeDirectory=black-ops-listen
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=no
+# Only used with KeepAcrossReboot=yes in listen.conf, when the installer has
+# made the folder. The leading dash lets the service start without it.
+ReadWritePaths=-/var/log/black-ops-listen
+
+# Nothing reaches the journal but the start and stop lines and a warning when
+# bpftrace or resolved's monitor goes away, which names no host or program.
+StandardInput=null
+StandardOutput=null
+StandardError=journal
+LogLevelMax=warning
+
+# Cheap to run: low priority, idle disk priority, bounded memory.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryMax=512M
+TasksMax=64
+LimitMEMLOCK=infinity
+UMask=0077
+
+# Nothing may leave the machine: only local sockets, and no IP traffic.
+PrivateNetwork=no
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+
+# bpftrace loads a BPF program and attaches a kprobe (CAP_BPF, CAP_PERFMON,
+# and CAP_SYS_ADMIN, which bpftrace still asks for on some paths), and reads
+# /proc/kallsyms (CAP_SYSLOG). The listener reads /proc/<pid>/exe of other
+# accounts' processes (CAP_SYS_PTRACE) and gives the view to the account's
+# group (CAP_CHOWN). Nothing else is kept.
+#
+# ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs and
+# ProtectProc are left out on purpose: the first three make /sys read-only,
+# hide /usr/lib/modules or drop CAP_SYSLOG, each of which bpftrace can need,
+# and the last would hide the processes the listener has to name.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYSLOG CAP_SYS_PTRACE CAP_CHOWN
+
+[Install]
+WantedBy=multi-user.target

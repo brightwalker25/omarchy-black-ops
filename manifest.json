@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "brightwalker25.black-ops",
+  "name": "Black Ops",
+  "version": "0.4.0",
+  "author": "brightwalker25",
+  "license": "MIT",
+  "description": "One switch for privacy protections in stock Omarchy, with a watchdog that shows when one has slipped. It sends nothing anywhere",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Black Ops",
+    "description": "A scope in the bar that switches a few privacy settings in stock Omarchy on or off together, and turns amber when an update undoes one",
+    "category": "System",
+    "aliases": [
+      "black-ops",
+      "privacy",
+      "telemetry",
+      "hosts",
+      "block",
+      "offline",
+      "watchdog"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshMinutes": 10,
+      "notifyOnSlip": true
+    },
+    "schema": [
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Check every (minutes)",
+        "min": 1,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "How often the watchdog checks that every protection is still in place. It runs with the panel closed, reads only local files, and touches no network."
+      },
+      {
+        "key": "notifyOnSlip",
+        "type": "boolean",
+        "label": "Notify when a protection slips",
+        "defaultValue": true,
+        "description": "Send one desktop notification when a protection stops holding, and no more until it has been put back. The notification names the protection and nothing else."
+      }
+    ]
+  }
+}

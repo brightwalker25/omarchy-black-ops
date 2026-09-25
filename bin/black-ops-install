@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+#
+# Install the privileged side of Black Ops: a root-owned helper that makes the
+# changes needing root, and a sudoers drop-in that lets one account run that
+# helper, with one of its fixed verbs, without a password.
+#
+# A bar panel has nowhere to type a password, so this is done once, here, in a
+# terminal where you can read what it does first. The helper is copied rather
+# than linked, so nothing root runs can be changed by editing the plugin
+# folder, and the plugin can be moved or removed without leaving root pointing
+# at a file anyone can write.
+#
+#   sudo bin/black-ops-install                  install or update
+#   sudo bin/black-ops-install --uninstall      remove every root-owned piece
+#   bin/black-ops-install --dry-run             show every action, change nothing
+#   bin/black-ops-install --print-sudoers NAME  print the rule that would be installed
+#   sudo bin/black-ops-install --listen-retention HOURS   keep listen mode's record 1 to 720 hours
+#   sudo bin/black-ops-install --listen-keep yes|no       keep it across reboots, on disk
+#
+# The account granted is the one that ran sudo. Pass --user NAME to choose
+# another, or when running from a root shell.
+
+set -euo pipefail
+
+LIBDIR=/usr/local/lib/omarchy-black-ops
+HELPER="$LIBDIR/apply"
+SUDOERS=/etc/sudoers.d/omarchy-black-ops
+
+# The only arguments the helper accepts, and so the only commands the rule
+# allows. system/apply holds the same list, and a test checks the two agree.
+VERBS=(
+  version
+  hosts-on hosts-off
+  dns-on dns-off
+  identity-on identity-off
+  chromium-on chromium-off
+  connectivity-on connectivity-off
+  avahi-on avahi-off
+  herdr-block-on herdr-block-off
+  localsend-close localsend-open
+  fwupd-p2p-on fwupd-p2p-off
+  listen-on listen-off listen-purge
+  bt-privacy-on bt-privacy-off
+  avahi-mask avahi-unmask
+)
+
+SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage() {
+  echo "usage: ${0##*/} [--dry-run] [--uninstall] [--user NAME] | --print-sudoers NAME" >&2
+  exit 2
+}
+
+valid_user() {
+  [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+# The rule names the helper once per verb, so sudo itself refuses any other
+# argument before the helper has even started. The helper checks again.
+render_sudoers() {
+  local user=$1 i last=$(( ${#VERBS[@]} - 1 ))
+  printf '# Installed by black-ops-install for the Black Ops bar plugin.\n'
+  printf '# Removed by black-ops-install --uninstall. Do not edit by hand.\n'
+  printf '#\n'
+  printf '# Lets %s run the privacy helper with one of its fixed verbs, and\n' "$user"
+  printf '# nothing else, without a password.\n'
+  printf '%s ALL=(root) NOPASSWD: \\\n' "$user"
+  for i in "${!VERBS[@]}"; do
+    if (( i < last )); then
+      printf '    %s %s, \\\n' "$HELPER" "${VERBS[$i]}"
+    else
+      printf '    %s %s\n' "$HELPER" "${VERBS[$i]}"
+    fi
+  done
+}
+
+DRY=0
+UNINSTALL=0
+TARGET_USER=""
+LISTEN_RETENTION=""
+LISTEN_KEEP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --user)
+      [ $# -ge 2 ] || usage
+      TARGET_USER="$2"
+      shift
+      ;;
+    --user=*) TARGET_USER="${1#--user=}" ;;
+    --listen-retention)
+      [ $# -ge 2 ] || usage
+      [[ $2 =~ ^[0-9]{1,3}$ ]] && [ "$2" -ge 1 ] && [ "$2" -le 720 ] \
+        || die "--listen-retention takes a number of hours from 1 to 720"
+      LISTEN_RETENTION=$((10#$2))
+      shift
+      ;;
+    --listen-keep)
+      [ $# -ge 2 ] || usage
+      [[ $2 =~ ^(yes|no)$ ]] || die "--listen-keep takes yes or no"
+      LISTEN_KEEP="$2"
+      shift
+      ;;
+    --print-sudoers)
+      [ $# -ge 2 ] || usage
+      valid_user "$2" || die "not a valid account name: $2"
+      render_sudoers "$2"
+      exit 0
+      ;;
+    -h | --help) usage ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+if [ "$(id -u)" -ne 0 ] && [ "$DRY" -eq 0 ]; then
+  die "This has to run as root: sudo $0 (or use --dry-run to see what it would do)"
+fi
+
+run() {
+  printf '  %s\n' "$*"
+  [ "$DRY" -eq 1 ] || "$@"
+}
+
+# ------------------------------------------------------------------ uninstall
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  # The pacman hook goes first: it runs a script from $LIBDIR, and a hook
+  # left pointing at nothing would fail on every pacman transaction.
+  run rm -f /etc/pacman.d/hooks/90-omarchy-black-ops-watch.hook
+  run rm -rf /var/lib/omarchy-black-ops
+  # Listen mode: stop the service, then overwrite what it recorded, in RAM
+  # and in the optional store that outlives a reboot, before removing it.
+  if [ -e /etc/systemd/system/omarchy-black-ops-listen.service ]; then
+    run systemctl disable --now omarchy-black-ops-listen.service || true
+    run rm -f /etc/systemd/system/omarchy-black-ops-listen.service
+    run systemctl daemon-reload
+  fi
+  for d in /run/black-ops-listen /var/log/black-ops-listen; do
+    if [ -d "$d" ] && [ ! -L "$d" ]; then
+      run find "$d" -xdev -type f -exec shred -fuz -- {} +
+      run rm -rf "$d"
+    fi
+  done
+  run rm -rf /etc/omarchy-black-ops
+  run rm -f "$SUDOERS"
+  run rm -rf "$LIBDIR"
+  echo
+  if [ "$DRY" -eq 1 ]; then
+    echo "Dry run: nothing was removed."
+  else
+    echo "Removed the helper, the sudoers rule, the pacman hook and listen mode,"
+    echo "whose record was overwritten before it was removed."
+  fi
+  echo
+  echo "The protections themselves were left exactly as they are. To return the"
+  echo "machine to stock, switch Black Ops off in the panel before uninstalling,"
+  echo "or run this again after reinstalling. By hand, the root-owned pieces are:"
+  echo "  the block between '# BEGIN black-ops' and '# END black-ops' in /etc/hosts"
+  echo "  /etc/systemd/resolved.conf.d/no-fallback.conf"
+  echo "  /etc/NetworkManager/conf.d/90-black-ops-identity.conf"
+  echo "  /etc/NetworkManager/conf.d/90-black-ops-connectivity.conf"
+  echo "  /etc/chromium/policies/managed/black-ops.json"
+  echo "  the lines marked black-ops in /etc/avahi/avahi-daemon.conf, /etc/fwupd/fwupd.conf"
+  echo "  and /etc/bluetooth/main.conf"
+  echo "  the Avahi daemon, if it was masked: systemctl unmask avahi-daemon.socket avahi-daemon.service"
+  echo "  Omarchy's LocalSend rules, if they were closed: ufw allow 53317/tcp and 53317/udp"
+  echo "Lines just above that block in /etc/hosts, outside it, are not Black Ops's."
+  echo
+  echo "The software watch's user units and its state in ~/.local/state/black-ops"
+  echo "belong to your account, so this leaves them. Switch the watch off in the"
+  echo "panel first to stop its units."
+  exit 0
+fi
+
+# ------------------------------------------------------------------ preflight
+
+if [ -z "$TARGET_USER" ]; then
+  TARGET_USER="${SUDO_USER:-}"
+fi
+# A dry run from your own account shows what would be granted to you.
+if [ -z "$TARGET_USER" ] && [ "$DRY" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+  TARGET_USER=$(id -un)
+fi
+[ -n "$TARGET_USER" ] || die \
+  "Cannot tell which account to grant. Run this with sudo from your own account,
+or pass --user NAME."
+valid_user "$TARGET_USER" || die "not a valid account name: $TARGET_USER"
+[ "$TARGET_USER" != root ] || die "Refusing to grant root; pass --user NAME for your own account."
+id -u "$TARGET_USER" >/dev/null 2>&1 || die "No such account: $TARGET_USER"
+
+[ -x /usr/bin/python3 ] || die "The helper needs /usr/bin/python3."
+command -v visudo >/dev/null || die "visudo is not installed, so the rule cannot be checked."
+[ -f "$SRC/system/apply" ] || die "Cannot find system/apply next to this installer."
+
+if [ "$DRY" -eq 0 ] && ! grep -Eq '^[[:space:]]*[@#]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers; then
+  die "/etc/sudoers does not include /etc/sudoers.d, so the rule would have no effect."
+fi
+
+echo "Installing Black Ops for $TARGET_USER"
+
+# ------------------------------------------------------------------ helper
+
+# Replacing the helper and the rule together is also what retires verbs an
+# earlier version had: the new helper refuses them, and the new rule no longer
+# lets sudo run them. The helper goes in under a temporary name and is renamed into place,
+# so a sudo call made during an update runs either the old helper or the new
+# one, never half of one.
+run install -d -o root -g root -m 755 "$LIBDIR"
+run install -o root -g root -m 755 "$SRC/system/apply" "$LIBDIR/.apply.new"
+run mv -f "$LIBDIR/.apply.new" "$HELPER"
+
+# ---- watch (phase 2, the software watch; see docs/contract.md, section 5)
+# A pacman hook that, after each transaction, has a small root-owned script
+# write the names of the packages installed or upgraded to a spool folder.
+# The script writes package names and nothing else, and never fails the
+# transaction. The user's own watch reads the spool; it needs no root.
+[ -f "$SRC/system/watch-spool" ] || die "Cannot find system/watch-spool next to this installer."
+[ -f "$SRC/system/90-omarchy-black-ops-watch.hook" ] || die "Cannot find the pacman hook next to this installer."
+run install -o root -g root -m 755 "$SRC/system/watch-spool" "$LIBDIR/.watch-spool.new"
+run mv -f "$LIBDIR/.watch-spool.new" "$LIBDIR/watch-spool"
+run install -d -o root -g root -m 755 /var/lib/omarchy-black-ops /var/lib/omarchy-black-ops/pending
+run install -d -o root -g root -m 755 /etc/pacman.d/hooks
+run install -o root -g root -m 644 "$SRC/system/90-omarchy-black-ops-watch.hook" \
+  /etc/pacman.d/hooks/.90-omarchy-black-ops-watch.hook.new
+run mv -f /etc/pacman.d/hooks/.90-omarchy-black-ops-watch.hook.new \
+  /etc/pacman.d/hooks/90-omarchy-black-ops-watch.hook
+# ---- end watch
+
+# ---- listen (phase 2, listen mode; see docs/contract.md, section 6)
+
+# The listener, the root copy of the signatures it matches, its settings and
+# its service. The service is installed disabled: the listen row in the panel
+# starts it through the helper's listen-on verb. Like the helper, the
+# listener is copied, never linked, so nothing root runs can be changed from
+# the plugin folder.
+LISTEN_UNIT=/etc/systemd/system/omarchy-black-ops-listen.service
+LISTEN_CONF=/etc/omarchy-black-ops/listen.conf
+LISTEN_KEEP_DIR=/var/log/black-ops-listen
+
+[ -f "$SRC/system/listen" ] || die "Cannot find system/listen next to this installer."
+[ -f "$SRC/system/omarchy-black-ops-listen.service" ] || die "Cannot find the listen service file."
+run install -o root -g root -m 755 "$SRC/system/listen" "$LIBDIR/.listen.new"
+run mv -f "$LIBDIR/.listen.new" "$LIBDIR/listen"
+run install -o root -g root -m 644 "$SRC/data/signatures.toml" "$LIBDIR/.signatures.toml.new"
+run mv -f "$LIBDIR/.signatures.toml.new" "$LIBDIR/signatures.toml"
+
+# A setting not given on this run keeps the value it had.
+if [ -z "$LISTEN_RETENTION" ] && [ -f "$LISTEN_CONF" ]; then
+  LISTEN_RETENTION=$(sed -n 's/^RetentionHours=\([0-9]\{1,3\}\)$/\1/p' "$LISTEN_CONF" | tail -n 1)
+fi
+if [ -z "$LISTEN_RETENTION" ] || [ "$LISTEN_RETENTION" -lt 1 ] || [ "$LISTEN_RETENTION" -gt 720 ]; then
+  LISTEN_RETENTION=72
+fi
+if [ -z "$LISTEN_KEEP" ] && [ -f "$LISTEN_CONF" ]; then
+  LISTEN_KEEP=$(sed -n 's/^KeepAcrossReboot=\(yes\|no\)$/\1/p' "$LISTEN_CONF" | tail -n 1)
+fi
+[ -n "$LISTEN_KEEP" ] || LISTEN_KEEP=no
+
+render_listen_conf() {
+  printf '# Written by black-ops-install for Black Ops listen mode. Change it by\n'
+  printf '# running the installer again with --listen-retention or --listen-keep.\n'
+  printf 'RetentionHours=%s\n' "$LISTEN_RETENTION"
+  printf 'Account=%s\n' "$TARGET_USER"
+  printf 'KeepAcrossReboot=%s\n' "$LISTEN_KEEP"
+}
+
+run install -d -o root -g root -m 755 /etc/omarchy-black-ops
+if [ "$DRY" -eq 1 ]; then
+  echo "  write $LISTEN_CONF (mode 0644):"
+  render_listen_conf | sed 's/^/    /'
+else
+  tmp=$(mktemp /etc/omarchy-black-ops/.listen.conf.XXXXXX)
+  render_listen_conf >"$tmp"
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$LISTEN_CONF"
+  echo "  write $LISTEN_CONF (mode 0644)"
+fi
+
+# The store that outlives a reboot. Copy-on-write is switched off while the
+# folder is still empty, which is the only time chattr +C has an effect, so
+# that shred overwrites the blocks a file really used on btrfs. Switching
+# the store off again overwrites and removes what it held.
+if [ "$LISTEN_KEEP" = yes ]; then
+  if [ ! -d "$LISTEN_KEEP_DIR" ]; then
+    run install -d -o root -g root -m 700 "$LISTEN_KEEP_DIR"
+    run chattr +C "$LISTEN_KEEP_DIR" || echo "  (chattr +C had no effect; this file system may not use copy-on-write)"
+  fi
+elif [ -d "$LISTEN_KEEP_DIR" ] && [ ! -L "$LISTEN_KEEP_DIR" ]; then
+  run find "$LISTEN_KEEP_DIR" -xdev -type f -exec shred -fuz -- {} +
+  run find "$LISTEN_KEEP_DIR" -xdev -depth -mindepth 1 -type d -empty -delete
+  run rmdir "$LISTEN_KEEP_DIR"
+fi
+
+run install -o root -g root -m 644 "$SRC/system/omarchy-black-ops-listen.service" \
+  "/etc/systemd/system/.omarchy-black-ops-listen.service.new"
+run mv -f "/etc/systemd/system/.omarchy-black-ops-listen.service.new" "$LISTEN_UNIT"
+run systemctl daemon-reload
+# A listener already running is restarted, so it reads the new copy and the
+# new settings. One that is not running stays as it is.
+run systemctl try-restart omarchy-black-ops-listen.service
+
+if ! command -v bpftrace >/dev/null; then
+  echo "  Note: bpftrace is not installed, so listen mode will show as not available."
+  echo "  Install it with: sudo pacman -S bpftrace"
+fi
+# ---- end listen
+
+# ------------------------------------------------------------------ sudoers
+
+# Written under a name containing a dot, which sudo skips when it reads
+# /etc/sudoers.d, checked with visudo, and only then renamed into place. A
+# rule with a mistake in it never becomes live, because a broken sudoers file
+# can lock every account out of sudo.
+if [ "$DRY" -eq 1 ]; then
+  echo "  write $SUDOERS (mode 0440), after checking it with visudo -cf:"
+  render_sudoers "$TARGET_USER" | sed 's/^/    /'
+else
+  tmp=$(mktemp /etc/sudoers.d/.omarchy-black-ops.XXXXXX)
+  trap 'rm -f "$tmp"' EXIT
+  render_sudoers "$TARGET_USER" >"$tmp"
+  chown root:root "$tmp"
+  chmod 0440 "$tmp"
+  visudo -cf "$tmp" >/dev/null || die "visudo rejected the rule; nothing was installed."
+  mv -f "$tmp" "$SUDOERS"
+  trap - EXIT
+  if ! visudo -c >/dev/null 2>&1; then
+    rm -f "$SUDOERS"
+    die "The sudoers configuration did not check out with the rule in place, so it was removed again."
+  fi
+  echo "  write $SUDOERS (mode 0440)"
+fi
+
+echo
+if [ "$DRY" -eq 1 ]; then
+  echo "Dry run: nothing was changed."
+  exit 0
+fi
+echo "Installed helper $("$HELPER" version | sed 's/^version: //'). $TARGET_USER can now run"
+echo "$HELPER with these verbs, and no others:"
+printf '  %s\n' "${VERBS[@]}"
+echo
+echo "This changed nothing else. If Black Ops is off, open the panel in the bar to"
+echo "switch it on. If it was already on, switch it on once more there, or run"
+echo "bin/black-ops on, so that anything an upgrade changes is put in place."

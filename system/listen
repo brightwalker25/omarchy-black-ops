@@ -1,0 +1,1088 @@
+#!/usr/bin/python3 -I
+"""Listen mode for the Black Ops bar plugin: the root listener.
+
+bin/black-ops-install copies this file to
+/usr/local/lib/omarchy-black-ops/listen, owned by root, and installs the
+omarchy-black-ops-listen service that runs it. The service is disabled until
+the listen row in the panel is switched on. docs/contract.md, section 6,
+fixes what it reads and what it writes; docs/listen.md describes it for the
+person using it.
+
+What it does:
+
+- It subscribes to systemd-resolved's monitor interface,
+  io.systemd.Resolve.Monitor, and notes each name that was looked up and the
+  addresses the answer gave, for as long as the answer's TTL (with a short
+  floor, because programs keep answers for a while).
+- It runs one bpftrace probe on the kernel's security_socket_connect hook,
+  which every connect() passes through, including io_uring ones. If that
+  probe cannot be attached it falls back to the connect() syscall
+  tracepoint. The probe prints the process, its user and the destination
+  address and port, and nothing else. The executable and the cgroup, which
+  names the app for a program Omarchy started through uwsm, are read from
+  /proc here.
+- It joins the two on the address, so a connection is tied to the name it
+  was looked up as, and keeps a count per program and host.
+- It matches each host against the root-owned copy of the signatures file.
+
+What it keeps, and where:
+
+- Hourly segments of one JSON line per event, under
+  /run/black-ops-listen/segments, which is tmpfs, so they are in RAM and gone
+  at shutdown. With KeepAcrossReboot=yes in listen.conf they are kept in
+  /var/log/black-ops-listen instead, a folder with copy-on-write switched off
+  before anything is written to it, so that overwriting a file really
+  overwrites its blocks on btrfs.
+- An aggregate, view/contacts.json, that the account named in listen.conf
+  can read. It holds program names, executable paths, unit names, host
+  names, times and counts.
+- Segments older than RetentionHours are overwritten with shred and removed
+  every hour.
+
+What it never does:
+
+- It opens no network socket. The service is also started with
+  RestrictAddressFamilies=AF_UNIX and IPAddressDeny=any, so it could not if
+  it tried.
+- It writes nothing to the journal apart from a warning when a source
+  fails, and that warning names no host and no program.
+
+SIGUSR1 purges everything it holds, in memory and on disk, which is what the
+helper's listen-purge verb asks for. SIGTERM stops it.
+"""
+import base64
+import calendar
+import fcntl
+import fnmatch
+import ipaddress
+import json
+import os
+import pwd
+import re
+import selectors
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+try:
+    import tomllib
+except ImportError:          # Python older than 3.11; signatures then match nothing
+    tomllib = None
+
+# Where things live. The tests replace these on the imported module.
+CONF = "/etc/omarchy-black-ops/listen.conf"
+SIGNATURES = "/usr/local/lib/omarchy-black-ops/signatures.toml"
+RUN_DIR = "/run/black-ops-listen"
+KEEP_DIR = "/var/log/black-ops-listen"
+MONITOR = "/run/systemd/resolve/io.systemd.Resolve.Monitor"
+BPFTRACE = "/usr/bin/bpftrace"
+SHRED = "/usr/bin/shred"
+PROC = "/proc"
+CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+DEFAULT_RETENTION = 72
+MIN_RETENTION = 1
+MAX_RETENTION = 720
+
+# How long an answer is kept for the join: its TTL, but never less than
+# JOIN_FLOOR, because a program keeps an answer after resolved says it has
+# expired, and never more than JOIN_CEILING.
+JOIN_FLOOR = 120
+JOIN_CEILING = 6 * 3600
+JOIN_MAX_ENTRIES = 50000
+JOIN_DELAY = 1.0
+
+# How often buffered lines reach the segment file and the view is rewritten.
+# Longer for the store on disk, so the disk is woken less often.
+FLUSH_RUN = 15
+FLUSH_DISK = 60
+
+RED_KINDS = ("telemetry", "analytics", "crash-report")
+FS_IOC_GETFLAGS = 0x80086601
+FS_IOC_SETFLAGS = 0x40086602
+FS_NOCOW_FL = 0x00800000
+
+SUBSCRIBE = {"method": "io.systemd.Resolve.Monitor.SubscribeQueryResults",
+             "parameters": {"allowInteractiveAuthentication": False}, "more": True}
+
+# The probe. security_socket_connect(struct socket *sock, struct sockaddr
+# *address, int addrlen) sees the address after the kernel has copied it in,
+# so the read cannot fail the way a read of user memory can. Only IPv4 and
+# IPv6 are printed; the port is printed as the kernel holds it, in network
+# order, and turned round in parse_probe_line().
+PROBE_KPROBE = r"""
+kprobe:security_socket_connect
+{
+  $sa = (struct sockaddr *)arg1;
+  if ($sa->sa_family == 2) {
+    $s4 = (struct sockaddr_in *)arg1;
+    printf("C\t%d\t%d\t4\t%d\t%s\t%s\n", pid, uid, $s4->sin_port,
+           ntop(2, $s4->sin_addr.s_addr), comm);
+  } else if ($sa->sa_family == 10) {
+    $s6 = (struct sockaddr_in6 *)arg1;
+    printf("C\t%d\t%d\t6\t%d\t%s\t%s\n", pid, uid, $s6->sin6_port,
+           ntop(10, $s6->sin6_addr.in6_u.u6_addr8), comm);
+  }
+}
+"""
+
+# The fallback reads the address from the caller's memory at syscall entry.
+# It misses io_uring connects, and a read can fail on a page not yet mapped.
+PROBE_TRACEPOINT = r"""
+tracepoint:syscalls:sys_enter_connect
+{
+  $sa = (struct sockaddr *)args.uservaddr;
+  if ($sa->sa_family == 2) {
+    $s4 = (struct sockaddr_in *)args.uservaddr;
+    printf("C\t%d\t%d\t4\t%d\t%s\t%s\n", pid, uid, $s4->sin_port,
+           ntop(2, $s4->sin_addr.s_addr), comm);
+  } else if ($sa->sa_family == 10) {
+    $s6 = (struct sockaddr_in6 *)args.uservaddr;
+    printf("C\t%d\t%d\t6\t%d\t%s\t%s\n", pid, uid, $s6->sin6_port,
+           ntop(10, $s6->sin6_addr.in6_u.u6_addr8), comm);
+  }
+}
+"""
+PROBES = (("kprobe", PROBE_KPROBE), ("tracepoint", PROBE_TRACEPOINT))
+
+
+def warn(text):
+    """One line to the journal at warning level. The service drops anything
+    below warning, so this is all it ever logs. Never pass a host or a
+    program name."""
+    try:
+        sys.stderr.write(f"<4>{text}\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ settings
+
+def parse_conf(text):
+    """listen.conf as {"retention": hours, "account": name or None,
+    "keep": bool}. Unknown keys and bad values are ignored."""
+    out = {"retention": DEFAULT_RETENTION, "account": None, "keep": False}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;" or "=" not in line:
+            continue
+        key, value = (p.strip() for p in line.split("=", 1))
+        if key == "RetentionHours" and re.fullmatch(r"[0-9]{1,6}", value):
+            out["retention"] = min(MAX_RETENTION, max(MIN_RETENTION, int(value)))
+        elif key == "Account" and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value):
+            out["account"] = value
+        elif key == "KeepAcrossReboot":
+            out["keep"] = value.lower() in ("yes", "true", "1")
+    return out
+
+
+def read_small(path, limit=1 << 20):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def account_gid(account):
+    """The account's primary group, or 0 when it cannot be found, in which
+    case only root can read the view."""
+    if not account:
+        return 0
+    try:
+        return pwd.getpwnam(account).pw_gid
+    except KeyError:
+        return 0
+
+
+# ---------------------------------------------------------------- signatures
+
+def load_signatures(text):
+    """[(id, vendor, kind, [patterns])] from the signatures file, or [] when
+    it cannot be read."""
+    if tomllib is None or not text:
+        return []
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return []
+    out = []
+    for sig in data.get("signature", []) if isinstance(data, dict) else []:
+        if not isinstance(sig, dict):
+            continue
+        sid, vendor, kind, hosts = sig.get("id"), sig.get("vendor"), sig.get("kind"), sig.get("hosts")
+        if isinstance(sid, str) and isinstance(kind, str) and isinstance(hosts, list):
+            pats = [normal_host(h) for h in hosts if isinstance(h, str)]
+            out.append((sid, vendor if isinstance(vendor, str) else "", kind, pats))
+    return out
+
+
+def normal_host(host):
+    return host.lower().rstrip(".") if isinstance(host, str) else host
+
+
+def match_host(host, signatures):
+    """(id, kind) of the first signature a host matches, or (None, None).
+    The rule in docs/contract.md, section 8."""
+    if not host:
+        return None, None
+    h = normal_host(host)
+    for sid, _vendor, kind, pats in signatures:
+        if any(fnmatch.fnmatchcase(h, p) for p in pats):
+            return sid, kind
+    return None, None
+
+
+# --------------------------------------------------------------------- DNS
+
+class VarlinkBuffer:
+    """Splits a varlink byte stream into messages, which are JSON objects
+    each ended by a NUL byte."""
+
+    def __init__(self, limit=4 << 20):
+        self.buf = b""
+        self.limit = limit
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+        while True:
+            i = self.buf.find(b"\0")
+            if i < 0:
+                break
+            raw, self.buf = self.buf[:i], self.buf[i + 1:]
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(msg, dict):
+                out.append(msg)
+        if len(self.buf) > self.limit:
+            # A message this long is not one resolved sends; drop it rather
+            # than grow without end.
+            self.buf = b""
+        return out
+
+
+def raw_ttl(raw):
+    """The TTL of a resource record in wire format, base64 encoded as
+    resolved's monitor sends it in `raw`, or None. The monitor's JSON form of
+    a record carries no TTL of its own."""
+    try:
+        data = base64.b64decode(raw, validate=False)
+    except (ValueError, TypeError):
+        return None
+    i = 0
+    # The owner name, as labels without compression.
+    while i < len(data):
+        n = data[i]
+        if n == 0:
+            i += 1
+            break
+        if n & 0xC0:
+            i += 2
+            break
+        i += 1 + n
+    else:
+        return None
+    if i + 10 > len(data):
+        return None
+    return int.from_bytes(data[i + 4:i + 8], "big")
+
+
+def rr_address(rr):
+    """The address in an A or AAAA record, as text, or None."""
+    if not isinstance(rr, dict):
+        return None
+    key = rr.get("key") or {}
+    addr = rr.get("address")
+    if not isinstance(addr, list) or not all(isinstance(b, int) and 0 <= b < 256 for b in addr):
+        return None
+    try:
+        if key.get("type") == 1 and len(addr) == 4:
+            return str(ipaddress.IPv4Address(bytes(addr)))
+        if key.get("type") == 28 and len(addr) == 16:
+            return str(ipaddress.IPv6Address(bytes(addr)))
+    except ValueError:
+        return None
+    return None
+
+
+def parse_query_result(msg):
+    """[(host, address, ttl)] from one SubscribeQueryResults reply. The host
+    is the name the program asked for, not the end of a CNAME chain, because
+    that is the name it chose to contact."""
+    params = msg.get("parameters") if isinstance(msg, dict) else None
+    if not isinstance(params, dict) or params.get("state") not in (None, "success"):
+        return []
+    questions = params.get("question") or []
+    host = None
+    for q in questions if isinstance(questions, list) else []:
+        if isinstance(q, dict) and isinstance(q.get("name"), str) and q.get("type") in (1, 28):
+            host = normal_host(q["name"])
+            break
+    if not host:
+        return []
+    out = []
+    for ans in params.get("answer") or []:
+        if not isinstance(ans, dict):
+            continue
+        addr = rr_address(ans.get("rr"))
+        if addr is None:
+            continue
+        ttl = raw_ttl(ans.get("raw")) if isinstance(ans.get("raw"), str) else None
+        out.append((host, addr, ttl))
+    return out
+
+
+class Joiner:
+    """Which host an address was last given as an answer for, and until
+    when. When several names share an address, the latest lookup wins."""
+
+    def __init__(self):
+        self.by_addr = {}
+
+    def add(self, host, addr, ttl, now):
+        keep = JOIN_FLOOR if ttl is None else min(JOIN_CEILING, max(JOIN_FLOOR, ttl))
+        self.by_addr.pop(addr, None)             # so insertion order is age order
+        self.by_addr[addr] = (host, now + keep)
+        if len(self.by_addr) > JOIN_MAX_ENTRIES:
+            self.expire(now)
+            while len(self.by_addr) > JOIN_MAX_ENTRIES:
+                self.by_addr.pop(next(iter(self.by_addr)))
+
+    def lookup(self, addr, now):
+        hit = self.by_addr.get(addr)
+        if hit is None:
+            return None
+        host, until = hit
+        return host if now <= until else None
+
+    def expire(self, now):
+        for addr in [a for a, (_, until) in self.by_addr.items() if until < now]:
+            del self.by_addr[addr]
+
+    def clear(self):
+        self.by_addr.clear()
+
+
+# ----------------------------------------------------------------- the probe
+
+def parse_probe_line(line):
+    """{"pid", "uid", "comm", "addr", "port"} from one line the probe
+    printed, or None for anything else, such as a bpftrace message."""
+    parts = line.rstrip("\n").split("\t", 6)
+    if len(parts) != 7 or parts[0] != "C":
+        return None
+    _, pid, uid, fam, port, addr, comm = parts
+    try:
+        pid, uid, port = int(pid), int(uid), int(port)
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    if fam not in ("4", "6") or not 0 <= port <= 0xFFFF:
+        return None
+    # The probe prints the port the way the kernel stores it, big-endian,
+    # read as a little-endian number.
+    port = ((port & 0xFF) << 8) | (port >> 8)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return {"pid": pid, "uid": uid, "comm": comm, "addr": str(ip), "port": port}
+
+
+def worth_keeping(ev):
+    """Connections that leave the machine. Loopback, such as a lookup sent
+    to resolved's stub on 127.0.0.53, and the unspecified address are not."""
+    ip = ipaddress.ip_address(ev["addr"])
+    return not (ip.is_loopback or ip.is_unspecified or ev["port"] == 0)
+
+
+def unit_of(cgroup_text):
+    """The systemd unit a process runs in, from /proc/<pid>/cgroup: the last
+    component that is a scope or a service. uwsm starts every app Omarchy
+    launches in a scope named app-...-<name>-<id>.scope."""
+    for line in (cgroup_text or "").splitlines():
+        if line.startswith("0::"):
+            for part in reversed(line[3:].split("/")):
+                if part.endswith((".scope", ".service")):
+                    return part
+    return None
+
+
+class ProcCache:
+    """The executable and unit of a pid, read from /proc and kept for a
+    minute, so a program that connects often costs one read."""
+
+    def __init__(self, proc=None, ttl=60):
+        self.proc = proc or PROC
+        self.ttl = ttl
+        self.cache = {}
+
+    def get(self, pid, comm, now):
+        hit = self.cache.get(pid)
+        if hit and hit[0] == comm and hit[1] > now:
+            return hit[2], hit[3]
+        exe = unit = None
+        try:
+            exe = os.readlink(f"{self.proc}/{pid}/exe")
+            if exe.endswith(" (deleted)"):
+                exe = exe[:-10]
+        except OSError:
+            pass
+        unit = unit_of(read_small(f"{self.proc}/{pid}/cgroup", 65536))
+        if len(self.cache) > 4096:
+            self.cache = {p: v for p, v in self.cache.items() if v[1] > now}
+            if len(self.cache) > 4096:
+                self.cache.clear()
+        self.cache[pid] = (comm, now + self.ttl, exe, unit)
+        return exe, unit
+
+
+# ------------------------------------------------------------------ segments
+
+def segment_name(t):
+    """The segment an event at epoch `t` belongs in, by the UTC hour, so a
+    change of clocks never gives two segments one name."""
+    return time.strftime("%Y%m%d%H", time.gmtime(t)) + ".jsonl"
+
+
+def segment_start(name):
+    """The epoch second a segment's hour starts, or None for a name that is
+    not a segment's."""
+    m = re.fullmatch(r"([0-9]{10})\.jsonl", name)
+    if not m:
+        return None
+    try:
+        return calendar.timegm(time.strptime(m.group(1), "%Y%m%d%H"))
+    except ValueError:
+        return None
+
+
+def expired(names, now, retention_hours):
+    """The segments whose whole hour ended before the retention window
+    began. The current hour is never among them."""
+    cutoff = now - retention_hours * 3600
+    out = []
+    for name in names:
+        start = segment_start(name)
+        if start is not None and start + 3600 <= cutoff:
+            out.append(name)
+    return sorted(out)
+
+
+def next_hour(now):
+    return (int(now) // 3600 + 1) * 3600
+
+
+def wipe(path):
+    """Overwrite a file and remove it: shred -fuz where it is installed,
+    else one pass of zeros. On tmpfs this is RAM; on disk, see
+    docs/listen.md for what it can and cannot do."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        os.unlink(path)
+        return
+    if os.path.exists(SHRED):
+        try:
+            r = subprocess.run([SHRED, "-fuz", "--", path], env=CLEAN_ENV,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=120)
+            if r.returncode == 0 and not os.path.lexists(path):
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    zero_and_unlink(path)
+
+
+def zero_and_unlink(path):
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        size = os.fstat(fd).st_size
+        block = b"\0" * 65536
+        done = 0
+        while done < size:
+            done += os.write(fd, block[:min(len(block), size - done)])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.unlink(path)
+
+
+def set_nocow(path):
+    """chattr +C on an empty folder, so files made in it on btrfs are
+    overwritten in place. It has no effect on a folder that already holds
+    files, and none at all on other file systems, where it is harmless."""
+    try:
+        if os.listdir(path):
+            return False
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        buf = bytearray(4)
+        fcntl.ioctl(fd, FS_IOC_GETFLAGS, buf)
+        flags = int.from_bytes(buf, sys.byteorder) | FS_NOCOW_FL
+        fcntl.ioctl(fd, FS_IOC_SETFLAGS, flags.to_bytes(4, sys.byteorder))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------ the aggregate
+
+def contact_key(ev):
+    host = ev.get("host")
+    return (ev.get("comm"), ev.get("exe"), ev.get("unit"), host, None if host else ev.get("addr"))
+
+
+class Aggregate:
+    """Contacts per hourly segment, so that dropping a segment drops exactly
+    its counts without reading anything back."""
+
+    def __init__(self):
+        self.by_segment = {}
+
+    def add(self, ev, segment=None):
+        seg = segment or segment_name(ev["t"])
+        contacts = self.by_segment.setdefault(seg, {})
+        key = contact_key(ev)
+        c = contacts.get(key)
+        if c is None:
+            contacts[key] = [ev["t"], ev["t"], 1]
+        else:
+            c[0] = min(c[0], ev["t"])
+            c[1] = max(c[1], ev["t"])
+            c[2] += 1
+
+    def drop(self, segments):
+        for seg in segments:
+            self.by_segment.pop(seg, None)
+
+    def clear(self):
+        self.by_segment.clear()
+
+    def merged(self):
+        out = {}
+        for contacts in self.by_segment.values():
+            for key, (first, last, count) in contacts.items():
+                c = out.get(key)
+                if c is None:
+                    out[key] = [first, last, count]
+                else:
+                    c[0] = min(c[0], first)
+                    c[1] = max(c[1], last)
+                    c[2] += count
+        return out
+
+    def since(self):
+        starts = [segment_start(s) for s in self.by_segment]
+        starts = [s for s in starts if s is not None]
+        return min(starts) if starts else None
+
+
+def build_view(agg, signatures, now, retention, started, health):
+    """The document the user side reads, docs/contract.md section 6.4. The
+    fields after `contacts` in each entry, and the health fields at the top,
+    are additions the contract allows a reader to ignore."""
+    contacts = []
+    for (comm, exe, unit, host, addr), (first, last, count) in agg.merged().items():
+        sig, kind = match_host(host, signatures)
+        entry = {"program": comm, "exe": exe, "unit": unit, "host": host,
+                 "signature": sig, "kind": kind,
+                 "firstSeen": first, "lastSeen": last, "count": count}
+        if host is None:
+            entry["addr"] = addr
+        contacts.append(entry)
+    contacts.sort(key=lambda c: (-c["lastSeen"], c["program"] or "", c["host"] or c.get("addr") or ""))
+    since = agg.since()
+    return {
+        "schema": 1,
+        "generatedAt": int(now),
+        "since": int(since if since is not None else started),
+        "retentionHours": retention,
+        "segments": len(agg.by_segment),
+        "probe": health.get("probe"),
+        "probeRunning": bool(health.get("probeRunning")),
+        "dnsConnected": bool(health.get("dnsConnected")),
+        "contacts": contacts,
+    }
+
+
+def segment_line(ev):
+    """One line of a segment, with the fields of docs/contract.md 6.4 in
+    their order."""
+    keys = ("t", "src", "pid", "comm", "exe", "unit", "uid", "host", "addr", "port")
+    return json.dumps({k: ev.get(k) for k in keys}, separators=(",", ":")) + "\n"
+
+
+def load_segment_lines(text, agg, segment):
+    """Rebuild one segment's counts from its lines, after a restart with
+    the store on disk. Only connect lines count."""
+    for line in text.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("src") == "connect" and isinstance(ev.get("t"), int):
+            agg.add(ev, segment)
+
+
+# --------------------------------------------------------------- the store
+
+class Store:
+    """The folders the listener writes, and every write it makes."""
+
+    def __init__(self, run_dir, keep_dir, keep, gid):
+        self.run_dir = run_dir
+        self.view_dir = os.path.join(run_dir, "view")
+        self.seg_dir = os.path.join(keep_dir if keep else run_dir, "segments")
+        self.keep_dir = keep_dir
+        self.keep = keep
+        self.gid = gid
+        self.pending = {}
+
+    def prepare(self):
+        """Make the folders with the modes of docs/contract.md 6.3. The run
+        folder itself is made by systemd; its group is set here so the
+        account can reach the view inside it."""
+        os.makedirs(self.run_dir, mode=0o750, exist_ok=True)
+        self._own(self.run_dir, 0o750, self.gid)
+        os.makedirs(self.view_dir, mode=0o750, exist_ok=True)
+        self._own(self.view_dir, 0o750, self.gid)
+        if self.keep:
+            os.makedirs(self.keep_dir, mode=0o700, exist_ok=True)
+            self._own(self.keep_dir, 0o700, 0)
+            set_nocow(self.keep_dir)
+        os.makedirs(self.seg_dir, mode=0o700, exist_ok=True)
+        self._own(self.seg_dir, 0o700, 0)
+        if self.keep:
+            set_nocow(self.seg_dir)
+
+    @staticmethod
+    def _own(path, mode, gid):
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"{path} is not a folder")
+        if info.st_uid != os.geteuid() or info.st_gid != gid:
+            try:
+                os.chown(path, os.geteuid(), gid)
+            except PermissionError:
+                pass
+        os.chmod(path, mode)
+
+    def queue(self, ev):
+        seg = segment_name(ev["t"])
+        self.pending.setdefault(seg, []).append(segment_line(ev))
+
+    def flush(self):
+        for seg, lines in self.pending.items():
+            path = os.path.join(self.seg_dir, seg)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600)
+            try:
+                os.write(fd, "".join(lines).encode("utf-8"))
+            finally:
+                os.close(fd)
+        self.pending.clear()
+
+    def segments(self):
+        try:
+            return sorted(n for n in os.listdir(self.seg_dir) if segment_start(n) is not None)
+        except OSError:
+            return []
+
+    def read_segment(self, name):
+        return read_small(os.path.join(self.seg_dir, name), 256 << 20) or ""
+
+    def remove(self, names):
+        for name in names:
+            wipe(os.path.join(self.seg_dir, name))
+
+    def purge(self):
+        """Every file the listener has written, overwritten and removed, in
+        both stores."""
+        self.pending.clear()
+        for folder in (os.path.join(self.run_dir, "segments"), os.path.join(self.keep_dir, "segments"),
+                       self.view_dir):
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                continue
+            for name in names:
+                wipe(os.path.join(folder, name))
+
+    def write_view(self, doc):
+        text = json.dumps(doc, separators=(",", ":")) + "\n"
+        tmp = os.path.join(self.view_dir, f".contacts.json.{os.getpid()}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, text.encode("utf-8"))
+            try:
+                os.fchown(fd, os.geteuid(), self.gid)
+            except PermissionError:
+                pass
+            os.fchmod(fd, 0o640)
+        except BaseException:
+            os.close(fd)
+            os.unlink(tmp)
+            raise
+        os.close(fd)
+        os.rename(tmp, os.path.join(self.view_dir, "contacts.json"))
+
+
+# ------------------------------------------------------------------- sources
+
+class Probe:
+    """bpftrace, started again with a growing pause whenever it dies. When
+    one probe fails to start twice in a row the other is tried."""
+
+    def __init__(self):
+        self.proc = None
+        self.choice = 0
+        self.fails = 0
+        self.started = 0.0
+        self.retry_at = 0.0
+        self.buf = b""
+
+    @property
+    def name(self):
+        return PROBES[self.choice][0]
+
+    def start(self):
+        cmd = [BPFTRACE, "-q", "-B", "line", "--no-warnings", "-e", PROBES[self.choice][1]]
+        self.started = time.monotonic()
+        try:
+            self.proc = subprocess.Popen(cmd, env=CLEAN_ENV, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         close_fds=True)
+        except OSError:
+            self.proc = None
+            self.failed()
+            return None
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.buf = b""
+        return self.proc.stdout
+
+    def failed(self):
+        """Note a death, and choose when and how to start again."""
+        quick = time.monotonic() - self.started < 30
+        self.fails = self.fails + 1 if quick else 1
+        if quick and self.fails % 2 == 0:
+            self.choice = (self.choice + 1) % len(PROBES)
+        pause = min(60, 2 ** min(self.fails, 6))
+        self.retry_at = time.monotonic() + pause
+        if self.fails in (1, 4, 16):
+            warn(f"black-ops listen: bpftrace stopped; trying the {self.name} probe in {pause} s")
+
+    def read(self):
+        """Lines the probe printed, or None when it has gone."""
+        try:
+            data = os.read(self.proc.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return []
+        except OSError:
+            data = b""
+        if not data:
+            return None
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        if len(self.buf) > 65536:
+            self.buf = b""
+        return [l.decode("utf-8", "replace") for l in lines]
+
+    def stop(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        try:
+            self.proc.stdout.close()
+        except OSError:
+            pass
+        self.proc = None
+
+
+class Monitor:
+    """The varlink subscription to systemd-resolved, opened again with a
+    growing pause whenever it closes, as it does when resolved restarts."""
+
+    def __init__(self):
+        self.sock = None
+        self.buf = VarlinkBuffer()
+        self.fails = 0
+        self.retry_at = 0.0
+
+    def connect(self):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+            s.settimeout(5)
+            s.connect(MONITOR)
+            s.sendall(json.dumps(SUBSCRIBE).encode("utf-8") + b"\0")
+            s.setblocking(False)
+        except OSError:
+            self.failed()
+            return None
+        self.sock = s
+        self.buf = VarlinkBuffer()
+        return s
+
+    def failed(self):
+        self.close()
+        self.fails += 1
+        pause = min(60, 2 ** min(self.fails, 6))
+        self.retry_at = time.monotonic() + pause
+        if self.fails in (1, 4, 16):
+            warn(f"black-ops listen: lost systemd-resolved's monitor; trying again in {pause} s")
+
+    def read(self):
+        """Messages, or None when the connection has closed or answered
+        with an error."""
+        try:
+            data = self.sock.recv(262144)
+        except BlockingIOError:
+            return []
+        except OSError:
+            data = b""
+        if not data:
+            return None
+        msgs = self.buf.feed(data)
+        for m in msgs:
+            if "error" in m:
+                return None
+        if msgs:
+            self.fails = 0
+        return msgs
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+
+# ---------------------------------------------------------------- the loop
+
+class Listener:
+    def __init__(self, conf, signatures, store, now=None):
+        self.retention = conf["retention"]
+        self.signatures = signatures
+        self.store = store
+        self.joiner = Joiner()
+        self.agg = Aggregate()
+        self.procs = ProcCache()
+        self.seen_resolve = {}          # segment -> set of (host, addr) already written
+        self.started = int(now if now is not None else time.time())
+        self.dirty = True
+        self.health = {"probe": None, "probeRunning": False, "dnsConnected": False}
+
+    # Events. Each takes the time it happened, so the tests can drive it.
+
+    def on_answers(self, answers, now):
+        seg = segment_name(now)
+        seen = self.seen_resolve.setdefault(seg, set())
+        for host, addr, ttl in answers:
+            self.joiner.add(host, addr, ttl, now)
+            # One resolve line per name and address per hour is enough to
+            # show what was looked up; a line per repeat would only fill RAM.
+            if (host, addr) not in seen:
+                seen.add((host, addr))
+                self.store.queue({"t": int(now), "src": "resolve", "host": host, "addr": addr})
+
+    def on_connect(self, ev, now):
+        if not worth_keeping(ev):
+            return None
+        exe, unit = self.procs.get(ev["pid"], ev["comm"], now)
+        full = {"t": int(now), "src": "connect", "pid": ev["pid"], "comm": ev["comm"],
+                "exe": exe, "unit": unit, "uid": ev["uid"],
+                "host": self.joiner.lookup(ev["addr"], now), "addr": ev["addr"],
+                "port": ev["port"]}
+        self.agg.add(full)
+        self.store.queue(full)
+        self.dirty = True
+        return full
+
+    def prune(self, now):
+        """Once an hour: drop and wipe what has passed the retention."""
+        old = set(expired(self.store.segments(), now, self.retention))
+        old |= set(expired(list(self.agg.by_segment), now, self.retention))
+        self.store.remove(sorted(old))
+        self.agg.drop(old)
+        for seg in old:
+            self.seen_resolve.pop(seg, None)
+        current = segment_name(now)
+        for seg in [s for s in self.seen_resolve if s != current]:
+            del self.seen_resolve[seg]
+        self.joiner.expire(now)
+        self.dirty = True
+        return sorted(old)
+
+    def purge(self):
+        self.agg.clear()
+        self.joiner.clear()
+        self.seen_resolve.clear()
+        self.store.purge()
+        self.dirty = True
+
+    def reload(self, now):
+        """After a restart with the store on disk, count what is kept."""
+        for name in self.store.segments():
+            load_segment_lines(self.store.read_segment(name), self.agg, name)
+        self.prune(now)
+
+    def view(self, now):
+        return build_view(self.agg, self.signatures, now, self.retention, self.started, self.health)
+
+    def write_view(self, now):
+        self.store.write_view(self.view(now))
+        self.dirty = False
+
+
+def run():
+    conf = parse_conf(read_small(CONF))
+    signatures = load_signatures(read_small(SIGNATURES))
+    store = Store(RUN_DIR, KEEP_DIR, conf["keep"], account_gid(conf["account"]))
+    os.umask(0o077)
+    store.prepare()
+    lst = Listener(conf, signatures, store)
+    if conf["keep"]:
+        lst.reload(time.time())
+    lst.write_view(time.time())
+
+    sel = selectors.DefaultSelector()
+    wake_r, wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    flags = {"purge": False, "stop": False}
+    signal.signal(signal.SIGUSR1, lambda *_: flags.__setitem__("purge", True))
+    signal.signal(signal.SIGTERM, lambda *_: flags.__setitem__("stop", True))
+    signal.signal(signal.SIGINT, lambda *_: flags.__setitem__("stop", True))
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    sel.register(wake_r, selectors.EVENT_READ, "wake")
+
+    probe, mon = Probe(), Monitor()
+    flush_every = FLUSH_DISK if conf["keep"] else FLUSH_RUN
+    # Connections wait a moment before they are joined, so an answer that
+    # reaches this process a little after the connect it led to still names it.
+    held = []
+    last_flush = time.monotonic()
+    hour_at = next_hour(time.time())
+
+    try:
+        while not flags["stop"]:
+            mono = time.monotonic()
+            if probe.proc is None and mono >= probe.retry_at:
+                out = probe.start()
+                if out is not None:
+                    sel.register(out, selectors.EVENT_READ, "probe")
+            if mon.sock is None and mono >= mon.retry_at:
+                s = mon.connect()
+                if s is not None:
+                    sel.register(s, selectors.EVENT_READ, "dns")
+            health = {"probe": probe.name, "probeRunning": probe.proc is not None,
+                      "dnsConnected": mon.sock is not None}
+            if health != lst.health:
+                lst.health = health
+                lst.dirty = True
+
+            # Sleep until something arrives, or until the next thing due:
+            # a flush if there is anything to flush, a retry, or the hour.
+            waits = [max(0.0, hour_at - time.time())]
+            if lst.dirty or store.pending:
+                waits.append(max(0.0, last_flush + flush_every - mono))
+            if probe.proc is None:
+                waits.append(max(0.0, probe.retry_at - mono))
+            if mon.sock is None:
+                waits.append(max(0.0, mon.retry_at - mono))
+            if held:
+                waits.append(max(0.0, held[0][0] + JOIN_DELAY - mono))
+            ready = sel.select(timeout=min(waits) + 0.05)
+            # Answers first, for the same reason connections are held.
+            ready.sort(key=lambda kv: kv[0].data != "dns")
+            for key, _ in ready:
+                now = time.time()
+                if key.data == "wake":
+                    try:
+                        while os.read(wake_r, 64):
+                            pass
+                    except BlockingIOError:
+                        pass
+                elif key.data == "probe":
+                    lines = probe.read()
+                    if lines is None:
+                        sel.unregister(key.fileobj)
+                        probe.stop()
+                        probe.failed()
+                        continue
+                    for line in lines:
+                        ev = parse_probe_line(line)
+                        if ev is not None and worth_keeping(ev):
+                            held.append((time.monotonic(), ev, now))
+                    probe.fails = 0 if time.monotonic() - probe.started > 30 else probe.fails
+                elif key.data == "dns":
+                    msgs = mon.read()
+                    if msgs is None:
+                        sel.unregister(key.fileobj)
+                        mon.failed()
+                        continue
+                    for m in msgs:
+                        lst.on_answers(parse_query_result(m), now)
+
+            mono = time.monotonic()
+            while held and held[0][0] + JOIN_DELAY <= mono:
+                _, ev, t = held.pop(0)
+                lst.on_connect(ev, t)
+            now = time.time()
+            if flags["purge"]:
+                held.clear()
+                flags["purge"] = False
+                lst.purge()
+                lst.write_view(now)
+                last_flush = time.monotonic()
+            # After a suspend the clock has jumped, which this catches too.
+            if now >= hour_at:
+                store.flush()
+                lst.prune(now)
+                hour_at = next_hour(now)
+            if time.monotonic() - last_flush >= flush_every and (lst.dirty or store.pending):
+                store.flush()
+                lst.write_view(now)
+                last_flush = time.monotonic()
+    finally:
+        probe.stop()
+        mon.close()
+        try:
+            store.flush()
+        except OSError:
+            pass
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        print("black-ops listen: this runs as root, from its service", file=sys.stderr)
+        return 1
+    try:
+        return run()
+    except OSError as exc:
+        warn(f"black-ops listen: stopped: {exc.strerror or type(exc).__name__}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

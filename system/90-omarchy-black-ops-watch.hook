@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Black Ops: noting changed packages for the software watch
+When = PostTransaction
+Exec = /usr/local/lib/omarchy-black-ops/watch-spool
+NeedsTargets

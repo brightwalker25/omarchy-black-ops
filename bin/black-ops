@@ -1,0 +1,3493 @@
+#!/usr/bin/env python3
+"""Switch a fixed set of privacy protections for stock Omarchy on and off,
+and report whether each one is still in place, for the
+brightwalker25.black-ops bar panel and for use from a terminal.
+
+Design notes:
+
+- Black Ops covers what stock Omarchy ships and sets up. Leaks that belong
+  to an app you install yourself are that app's to handle, and rows for them
+  were removed in 0.2.0 without undoing them (see FORMER_ROWS).
+- The script decides and the panel renders. Whether a protection is in
+  place, whether it has slipped, and what switching it would do are worked
+  out here and published as JSON. The QML holds no policy, and every answer
+  it shows can be reproduced at the command line with `black-ops --text`.
+- Nothing here touches the network. A status run reads a handful of local
+  files and nothing else. It is cheap enough to run on a timer with the
+  panel closed, which is what lets the bar icon turn amber on its own.
+- Nothing here runs as root. The changes that need root (the hosts block
+  and the drop-ins in /etc) are made by a separate helper that
+  the installer copies to /usr/local/lib and that sudo lets this account run
+  without a password, with one fixed verb and nothing else. Until the
+  installer has been run, or while the installed copy is older than the one
+  in the plugin folder, those rows say so and the helper is not called.
+- Switching off undoes only what this plugin applied or adopted. A small
+  state file records which rows those are. A protection that was already in
+  place when the plugin was switched on is adopted: it is recorded, not
+  applied a second time, and it is removed on the way off like any other,
+  because off means the machine as it ships.
+- Colour is decided here too, by one rule. Green is on and holding. Amber
+  is a real problem: a protection that is switched on but not in place, the
+  helper needs reinstalling, a change waits for a reconnect or a new login,
+  a row cannot be verified, a pair window has overrun, or something could
+  not be removed. Red is kept for one thing only: listen mode saw a program
+  on this machine actually contact a host that matches a telemetry
+  signature. Grey is off, switched off by you, or not applicable. An
+  optional row that is off is grey, never amber.
+- Optional rows are off by default, have their own switch, and are never
+  switched on by the main switch.
+- Rows that other stacks register in rows.d only report. They have no
+  switch, because switchable fixes cover stock Omarchy only.
+- It sends nothing anywhere and logs nothing. The state file holds row
+  names, the words "applied" or "adopted", times, short error messages, the
+  Omarchy version last checked, and what a few rows need to put things back
+  exactly: the Bluetooth alias it replaced, the update badge's place on the
+  bar, and which developer tools it changed. It never holds a coordinate or
+  a file's contents.
+
+Exit status is 0 whenever a status was printed, including after an action
+that partly failed; the failures are reported inside the JSON.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+VERSION = "0.4.0"
+HELPER_DEFAULT = "/usr/local/lib/omarchy-black-ops/apply"
+# The helper as it is in this plugin folder. The installed copy should be
+# byte for byte the same; when it is not, it is from another version.
+HELPER_SOURCE = Path(__file__).resolve().parent.parent / "system" / "apply"
+INSTALL_HINT = ("The one-time install has not been done. Run "
+                "sudo bin/black-ops-install from the plugin folder.")
+OUTDATED_HINT = ("The root helper installed on this machine is from {old}, not from this "
+                 "version of Black Ops, so the rows that need root are left as they are. "
+                 "Run sudo bin/black-ops-install once more from the plugin folder.")
+
+# These must match system/apply; a test checks that they do.
+TELEMETRY_HOSTS = (
+    "http-intake.logs.us5.datadoghq.com",
+)
+HERDR_HOSTS = (
+    "herdr.dev",
+)
+MANAGED_HOSTS = TELEMETRY_HOSTS + HERDR_HOSTS
+SINKS = ("0.0.0.0", "::")
+BEGIN = "# BEGIN black-ops"
+END = "# END black-ops"
+IDENTITY_NAME = "90-black-ops-identity.conf"
+CONNECTIVITY_NAME = "90-black-ops-connectivity.conf"
+CHROMIUM_POLICY_NAME = "black-ops.json"
+CHROMIUM_POLICIES = (
+    ("SearchSuggestEnabled", False),
+    ("NetworkPredictionOptions", 2),
+    ("AlternateErrorPagesEnabled", False),
+    ("SpellCheckServiceEnabled", False),
+    ("MetricsReportingEnabled", False),
+    ("UrlKeyedAnonymizedDataCollectionEnabled", False),
+    ("BlockThirdPartyCookies", True),
+    ("WebRtcIPHandling", "default_public_interface_only"),
+    ("PrivacySandboxAdTopicsEnabled", False),
+    ("PrivacySandboxSiteEnabledAdsEnabled", False),
+    ("PrivacySandboxAdMeasurementEnabled", False),
+    ("PasswordLeakDetectionEnabled", False),
+    ("BackgroundModeEnabled", False),
+    ("EnableMediaRouter", False),
+)
+# Policies added after 0.3.0. A policy file written by an earlier version
+# lacks them, and reads as not applied yet rather than as altered.
+CHROMIUM_NEW = ("EnableMediaRouter",)
+AVAHI_MARK = "# black-ops: set by the Black Ops bar plugin, and removed when it is switched off"
+AVAHI_KEY = "disable-publishing"
+AVAHI_UNITS = ("avahi-daemon.socket", "avahi-daemon.service")
+BT_PRIVACY_MARK = "# black-ops: set by the Black Ops bar plugin, and removed when it is switched off"
+# The Privacy values in BlueZ's main.conf that give the adapter a private
+# address. "off", the default, keeps its fixed one.
+BT_PRIVATE = ("device", "network", "on", "limited-device", "limited-network")
+
+# What the network identity drop-in sets. Booleans are compared by meaning,
+# since NetworkManager accepts 0, false, no and off alike.
+IDENTITY_WANTED = {
+    "ipv4.dhcp-send-hostname": "false",
+    "ipv6.dhcp-send-hostname": "false",
+    "wifi.cloned-mac-address": "stable",
+    "ethernet.cloned-mac-address": "stable",
+    "ipv6.ip6-privacy": "2",
+}
+
+BT_ALIAS = "laptop"
+BT_UNIT = "black-ops-bluetooth.service"
+PAIR_UNIT = "black-ops-pair-window"
+PAIR_SECONDS = 60
+# How long after a pair window should have closed the adapter may still be
+# pairable before it counts as exposed rather than as a window that overran.
+PAIR_GRACE = 120
+
+DEBUGINFOD_NAME = "90-black-ops-debuginfod"
+OPT_OUT_NAME = "90-black-ops-opt-out"
+# The opt-out variables the opt-out row exports, in the order it writes them.
+OPT_OUT_VARS = (
+    ("DO_NOT_TRACK", "1"),
+    ("DENO_NO_UPDATE_CHECK", "1"),
+    ("NEXT_TELEMETRY_DISABLED", "1"),
+    ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+    ("CHECKPOINT_DISABLE", "1"),
+    ("ASTRO_TELEMETRY_DISABLED", "1"),
+    ("GATSBY_TELEMETRY_DISABLED", "1"),
+    ("TURBO_TELEMETRY_DISABLED", "1"),
+    ("STORYBOOK_DISABLE_TELEMETRY", "1"),
+    ("AZURE_CORE_COLLECT_TELEMETRY", "0"),
+    ("POWERSHELL_TELEMETRY_OPTOUT", "1"),
+    ("SAM_CLI_TELEMETRY", "0"),
+    ("VCPKG_DISABLE_METRICS", "1"),
+    ("HINT_TELEMETRY", "off"),
+)
+CRASH_UNIT = "omarchy-crash-watch.service"
+# fwupd's remote flags for peer-to-peer sharing, as fwupdmgr reports them.
+FWUPD_P2P_FLAGS = 16 | 32
+
+UPDATE_BADGE_ID = "omarchy.system-update"
+WEBAPP_LAUNCHER = "omarchy-launch-webapp"
+WEBAPP_MARK = "X-Black-Ops-Exec"
+LOCALSEND_TUPLE = re.compile(
+    r"^### tuple ### allow (tcp|udp) 53317 (?:0\.0\.0\.0/0|::/0) any (?:0\.0\.0\.0/0|::/0) in(?:\s|$)")
+
+# The status each row can have, and the one colour each stands for. The
+# panel and the bar draw these names and decide nothing themselves.
+COLOURS = {"ok": "green", "warn": "amber", "leak": "red", "off": "grey", "na": "grey"}
+OVERALL_COLOURS = {"ok": "green", "warn": "amber", "leak": "red", "off": "grey"}
+
+AGENTS_ID = "omarchy.agents"
+AGENTS_WANTED = {"claude": True, "codex": False, "fireworks": False}
+CLAUDE_KEYS = ("DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING")
+
+
+class ActionError(Exception):
+    """A change that could not be made, with a message fit for the panel."""
+
+
+# ------------------------------------------------------------------ context
+
+class Context:
+    """Every path and command the script uses, taken from one environment so
+    that the tests can point all of it at a temporary folder."""
+
+    def __init__(self, environ=None):
+        e = dict(os.environ if environ is None else environ)
+        self.environ = e
+        self.home = Path(e.get("HOME") or os.path.expanduser("~"))
+        self.etc = Path(e.get("BLACK_OPS_ETC", "/etc"))
+        self.helper_path = e.get("BLACK_OPS_HELPER", HELPER_DEFAULT)
+        self.sudo = e.get("BLACK_OPS_SUDO", "sudo")
+        state_home = e.get("XDG_STATE_HOME") or str(self.home / ".local" / "state")
+        self.state_dir = Path(state_home) / "omarchy-black-ops"
+        # Software watch, listen mode and the summary other tools read; see
+        # docs/contract.md.
+        self.watch_dir = Path(state_home) / "black-ops"
+        claude_dir = e.get("CLAUDE_CONFIG_DIR") or str(self.home / ".claude")
+        self.claude_settings = Path(claude_dir) / "settings.json"
+        self.weather = self.home / ".local/state/omarchy/settings/weather.json"
+        self.shell_json = self.home / ".config/omarchy/shell.json"
+        self.hosts = self.etc / "hosts"
+        self.dns_dropin_dir = self.etc / "systemd/resolved.conf.d"
+        self.dns_dropin = self.dns_dropin_dir / "no-fallback.conf"
+        self.sys = Path(e.get("BLACK_OPS_SYS", "/sys"))
+        self.usr_lib = Path(e.get("BLACK_OPS_USR_LIB", "/usr/lib"))
+        self.run_dir = Path(e.get("BLACK_OPS_RUN", "/run"))
+        self.data_home = Path(e.get("XDG_DATA_HOME") or str(self.home / ".local" / "share"))
+        self.config_home = Path(e.get("XDG_CONFIG_HOME") or str(self.home / ".config"))
+        self.nm_dir = self.etc / "NetworkManager"
+        self.identity_dropin = self.nm_dir / "conf.d" / IDENTITY_NAME
+        self.connectivity_dropin = self.nm_dir / "conf.d" / CONNECTIVITY_NAME
+        self.chromium_policies = self.etc / "chromium/policies/managed"
+        self.avahi_conf = self.etc / "avahi/avahi-daemon.conf"
+        self.system_units = self.etc / "systemd/system"
+        self.bt_main_conf = self.etc / "bluetooth/main.conf"
+        self.ufw_dir = self.etc / "ufw"
+        self.applications = self.data_home / "applications"
+        self.webapp_wrapper = self.data_home / "omarchy-black-ops" / "bin" / "black-ops-webapp"
+        self.user_units = self.config_home / "systemd" / "user"
+        self.bt_unit = self.user_units / BT_UNIT
+        self.pair_file = self.state_dir / "pair-until"
+        self.pacman_db = Path(e.get("BLACK_OPS_PACMAN_DB", "/var/lib/pacman/local"))
+        self.codex_config = Path(e.get("CODEX_HOME") or str(self.home / ".codex")) / "config.toml"
+        self.grok_config = self.home / ".grok" / "config.toml"
+        self.uwsm_env_dir = self.config_home / "uwsm" / "env.d"
+        self.debuginfod_dropin = self.uwsm_env_dir / DEBUGINFOD_NAME
+        self.opt_out_dropin = self.uwsm_env_dir / OPT_OUT_NAME
+        self.nvim_lazy = self.config_home / "nvim/lua/config/lazy.lua"
+        self.npmrc = Path(e.get("NPM_CONFIG_USERCONFIG") or str(self.home / ".npmrc"))
+        self.crash_mask = self.user_units / (CRASH_UNIT)
+        self.crash_toggle = self.home / ".local/state/omarchy/toggles/crash-capture-off"
+        self.rows_d = self.config_home / "omarchy-black-ops" / "rows.d"
+        # Set for one run after the Omarchy version has changed; see strict_run().
+        self.strict = False
+        # The state as last loaded, so that a row can see whether another row
+        # owns part of what it would change; see claude_owned().
+        self.state = None
+        self._helper = None
+
+    def run(self, cmd, timeout=10, cwd=None):
+        """(exit code, stdout, stderr). A missing command is exit 127."""
+        try:
+            r = subprocess.run(cmd, env=self.environ, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=timeout, cwd=cwd)
+            return r.returncode, r.stdout, r.stderr
+        except FileNotFoundError:
+            return 127, "", f"{cmd[0]}: not found"
+        except subprocess.TimeoutExpired:
+            return 124, "", f"{cmd[0]}: timed out"
+        except OSError as exc:
+            return 126, "", f"{cmd[0]}: {exc.strerror}"
+
+    def which(self, name):
+        return shutil.which(name, path=self.environ.get("PATH", ""))
+
+    def helper_installed(self):
+        return os.path.isfile(self.helper_path) and os.access(self.helper_path, os.X_OK)
+
+    def helper_state(self):
+        """("missing" | "outdated" | "current", the installed helper's
+        version or ""). The installed copy is compared with the one in the
+        plugin folder by its SHA-256, read as a plain file; nothing is run
+        and sudo is not asked, so the watchdog can check it on every tick."""
+        if self._helper is None:
+            if not self.helper_installed():
+                self._helper = ("missing", "")
+            else:
+                try:
+                    with open(self.helper_path, "rb") as fh:
+                        installed = fh.read()
+                except OSError:
+                    installed = None
+                try:
+                    source = HELPER_SOURCE.read_bytes()
+                except OSError:
+                    source = None
+                m = re.search(rb'^HELPER_VERSION = "([0-9.]+)"', installed or b"", re.M)
+                old = m.group(1).decode() if m else ""
+                if source is None or installed is None or \
+                        hashlib.sha256(installed).digest() == hashlib.sha256(source).digest():
+                    self._helper = ("current", old)
+                else:
+                    self._helper = ("outdated", old)
+        return self._helper
+
+    def helper_note(self):
+        """What the panel should say about the helper, or ""."""
+        state, old = self.helper_state()
+        if state == "missing":
+            return INSTALL_HINT
+        if state == "outdated":
+            return OUTDATED_HINT.format(old=f"version {old}" if old else "a version before 0.2.0")
+        return ""
+
+    def helper(self, verb):
+        """Run one verb of the root helper through sudo, without a prompt.
+        An outdated helper is never run: an older copy may do more than this
+        version asks of it, such as removing lines it no longer owns."""
+        if self.helper_state()[0] != "current":
+            raise ActionError(self.helper_note())
+        rc, out, err = self.run([self.sudo, "-n", self.helper_path, verb], timeout=120)
+        if rc == 0:
+            return out.strip()
+        err = (err or "").strip()
+        if err.startswith("sudo:") or "password is required" in err:
+            raise ActionError("sudo will not run the helper without a password. " + INSTALL_HINT)
+        last = err.splitlines()[-1] if err else f"{verb} failed"
+        last = re.sub(r"^black-ops apply: (?:[a-z-]+: )?", "", last)
+        raise ActionError(last[:300])
+
+
+# ------------------------------------------------------------- small tools
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+            return fh.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def detect_indent(text):
+    """The indent a JSON file was written with, so a rewrite looks like the
+    file it replaces: 2 for jq and Omarchy, 4 for a VPN app's own writer."""
+    for line in (text or "").splitlines()[1:]:
+        m = re.match(r"^([ \t]+)\S", line)
+        if m:
+            return "\t" if m.group(1).startswith("\t") else len(m.group(1))
+    return 2
+
+
+def dump_like(original, data):
+    """Serialise `data` in the style of `original`: the same indent, the same
+    treatment of non-ASCII text, and a final newline only if it had one. Key
+    order is kept as it was read, so a file whose values did not change is
+    written back byte for byte."""
+    original = original or ""
+    ascii_only = "\\u" in original and not any(ord(c) > 127 for c in original)
+    out = json.dumps(data, indent=detect_indent(original), ensure_ascii=ascii_only)
+    if original == "" or original.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def atomic_write(path, text, mode=0o644):
+    """Replace a file of this account's atomically. The new contents go to a
+    fresh file in the same folder, created with O_EXCL and O_NOFOLLOW, which
+    is then renamed over the old one. A link is resolved first, so a settings
+    file kept in a dotfiles folder is updated where it lives rather than
+    replaced by a copy."""
+    real = Path(os.path.realpath(path))
+    try:
+        info = os.lstat(real)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode):
+            raise ActionError(f"{real.name} is not a plain file; left alone")
+        if info.st_uid != os.getuid():
+            raise ActionError(f"{real.name} belongs to another account; left alone")
+        mode = stat.S_IMODE(info.st_mode)
+    real.parent.mkdir(parents=True, exist_ok=True)
+    tmp = real.with_name(f".{real.name}.black-ops.{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        data = text.encode("utf-8", "surrogateescape")
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    os.close(fd)
+    os.replace(tmp, real)
+    with contextlib.suppress(OSError):
+        dfd = os.open(real.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+def load_json(path):
+    """(text, data), (None, None) when absent. Raises ActionError when the
+    file is there but is not JSON, since guessing would risk the file."""
+    text = read_text(path)
+    if text is None:
+        return None, None
+    try:
+        return text, json.loads(text)
+    except ValueError:
+        raise ActionError(f"{Path(path).name} is not valid JSON, so it has been left alone")
+
+
+# ---------------------------------------------------------------- the hosts
+
+def hosts_view(text):
+    """What the hosts file says about the names this plugin cares about."""
+    lines = (text or "").split("\n")
+    starts = [i for i, l in enumerate(lines) if l.strip() == BEGIN]
+    ends = [i for i, l in enumerate(lines) if l.strip() == END]
+    damaged = bool(starts or ends) and not (
+        len(starts) == 1 and len(ends) == 1 and ends[0] > starts[0])
+    inside = set()
+    if starts and ends and not damaged:
+        inside = set(range(starts[0] + 1, ends[0]))
+    v4, v6, b4, b6 = set(), set(), set(), set()
+    hand = set()
+    foreign = False
+    for i, line in enumerate(lines):
+        t = line.split("#", 1)[0].split()
+        if i in inside and t and not (len(t) >= 2 and t[0] in SINKS
+                                      and set(t[1:]) <= set(MANAGED_HOSTS)):
+            # Something inside the block that is not the block's own, such
+            # as a host an earlier version kept there.
+            foreign = True
+        if len(t) < 2 or t[0] not in SINKS:
+            continue
+        names = set(t[1:])
+        (v4 if t[0] == "0.0.0.0" else v6).update(names)
+        if i in inside:
+            (b4 if t[0] == "0.0.0.0" else b6).update(names)
+        elif "#" not in line and len(t) == 2:
+            hand.add(t[1])
+    return {"blocked": v4 & v6, "block": b4 & b6, "hand": hand,
+            "foreign": foreign, "damaged": damaged, "present": bool(starts)}
+
+
+# ------------------------------------------------------------------ the rows
+
+def result(state, value, detail="", work=False, core=False, attention="", why="", leak=False,
+           new=False):
+    """A row's reading. state is in, out, partial or na. work means it is in
+    place but switching on still has something to tidy; core means it is not
+    fully in place, but its main part is, so switching on adopts it rather
+    than applying it. attention is a plain sentence saying what needs looking
+    at although nothing is exposed, which makes the row amber rather than
+    green. why says, for a row that is not in place, what is wrong. state
+    may also be unknown, for a row that could not be read. leak is for listen
+    mode alone: it saw a telemetry contact happen, which makes the row red.
+    new means what is in place was put there by an earlier version, and this
+    version adds to it, so a row not in place reads as not applied yet rather
+    than as slipped."""
+    return {"state": state, "value": value, "detail": detail, "work": work, "core": core,
+            "attention": attention, "why": why, "leak": leak, "new": new}
+
+
+class Row:
+    """One protection. To add one, subclass this, fill in the four
+    attributes and the three methods, and add an instance to ROWS below.
+
+    check() reads the machine and returns result(); it must never write, and
+    must return "na" when the thing it protects is not there, so that the
+    row is skipped cleanly. `rec` is the row's record in the state file, or
+    None. apply() puts the protection in place and revert() takes it out
+    again; apply() may note in `rec` what it created so revert() removes
+    only that. A row that needs root sets `privileged` and calls ctx.helper()
+    with a verb that system/apply and the installer's VERBS both list. An
+    optional row is off until switched on by itself, and the main switch
+    never switches it on. heal(), where a row has one, is run by the
+    watchdog and puts back a protection that is known to reset itself."""
+    id = ""
+    label = ""
+    privileged = False
+    one_way = False
+    optional = False
+    registered = False
+    about = ""
+
+    def check(self, ctx, rec=None):
+        raise NotImplementedError
+
+    def heal(self, ctx):
+        return False
+
+    def apply(self, ctx, chk, rec):
+        raise NotImplementedError
+
+    def revert(self, ctx, rec):
+        raise NotImplementedError
+
+
+class HostsRow(Row):
+    id = "hosts"
+    label = "Claude Code telemetry host"
+    privileged = True
+    about = ("Sinks http-intake.logs.us5.datadoghq.com, the Datadog intake Claude "
+             "Code sends its telemetry to, on IPv4 and IPv6, in a marked block in "
+             "/etc/hosts. A backstop for the row above, in case a Claude Code "
+             "update stops honouring its switches.")
+
+    def check(self, ctx, rec=None):
+        text = read_text(ctx.hosts)
+        if text is None:
+            return result("out", "no hosts file", self.about)
+        v = hosts_view(text)
+        if v["damaged"]:
+            return result("partial", "block damaged",
+                          "The black-ops block in /etc/hosts has a missing or "
+                          "extra marker. Fix it by hand; the plugin will not guess.")
+        n = sum(1 for h in TELEMETRY_HOSTS if h in v["blocked"])
+        if n == 0 and not ctx.claude_settings.parent.is_dir():
+            return result("na", "Claude Code not set up",
+                          "Claude Code has no settings folder for this account, so there "
+                          "is nothing for this block to back up.")
+        in_block = all(h in v["block"] for h in TELEMETRY_HOSTS)
+        stray = any(h in v["hand"] for h in TELEMETRY_HOSTS)
+        if n == len(TELEMETRY_HOSTS) and in_block and not stray and not v["foreign"]:
+            return result("in", "blocked", self.about)
+        if n == len(TELEMETRY_HOSTS) and stray:
+            return result("in", "blocked by hand", self.about +
+                          " Switching on moves the hand-written lines into the marked block.",
+                          work=True)
+        if n == len(TELEMETRY_HOSTS):
+            return result("in", "blocked, block to tidy", self.about +
+                          " The block also holds lines from an earlier version of Black Ops"
+                          " for hosts it no longer manages. Switching on again moves them"
+                          " out of the block, just above it, where they stay blocked.",
+                          work=True)
+        if n == 0:
+            return result("out", "not blocked", self.about)
+        return result("partial", f"{n} of {len(TELEMETRY_HOSTS)} blocked", self.about)
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("hosts-on")
+
+    def revert(self, ctx, rec):
+        ctx.helper("hosts-off")
+
+
+def resolve_fallback(text):
+    """The last FallbackDNS= value in the [Resolve] section, or None."""
+    section, value = None, None
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s[0] in "#;":
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip()
+            continue
+        if section == "Resolve" and "=" in s:
+            k, v = s.split("=", 1)
+            if k.strip() == "FallbackDNS":
+                value = v.strip()
+    return value
+
+
+class DnsRow(Row):
+    id = "dns"
+    label = "DNS fallback servers"
+    privileged = True
+    about = ("A drop-in empties FallbackDNS for systemd-resolved, so a dropped "
+             "VPN or a dead resolver never sends your lookups to the public "
+             "servers compiled into systemd.")
+
+    def check(self, ctx, rec=None):
+        has = resolve_fallback(read_text(ctx.dns_dropin)) == ""
+        overridden = None
+        try:
+            names = sorted(n for n in os.listdir(ctx.dns_dropin_dir) if n.endswith(".conf"))
+        except OSError:
+            names = []
+        for name in names:
+            if name > ctx.dns_dropin.name:
+                v = resolve_fallback(read_text(ctx.dns_dropin_dir / name))
+                if v:
+                    overridden = name
+        if has and overridden:
+            return result("partial", "overridden", self.about +
+                          f" A later drop-in, {overridden}, sets fallback servers again.")
+        if has:
+            return result("in", "none", self.about)
+        return result("out", "systemd defaults", self.about)
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("dns-on")
+
+    def revert(self, ctx, rec):
+        ctx.helper("dns-off")
+
+
+# The weather location is snapped to the centre of a grid square about 1.5
+# miles (2.4 km) on each side, the same size east to west as north to south,
+# so the stored point says only which square you are in. Anchored at 0,0, so
+# the same place always gives the same square, and snapping twice changes
+# nothing.
+WEATHER_GRID_KM = 2.414
+KM_PER_DEGREE = 111.32
+
+
+def is_coordinate(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def snap_location(lat, lon):
+    lat_step = WEATHER_GRID_KM / KM_PER_DEGREE
+    lat = round(round(lat / lat_step) * lat_step, 4)
+    lat = max(-90.0, min(90.0, lat))
+    lon_step = min(360.0, lat_step / max(math.cos(math.radians(lat)), 1e-6))
+    lon = round(round(lon / lon_step) * lon_step, 4)
+    if lon > 180:
+        lon = round(lon - 360, 4)
+    elif lon < -180:
+        lon = round(lon + 360, 4)
+    return lat, lon
+
+
+def on_grid(lat, lon):
+    return snap_location(lat, lon) == (lat, lon)
+
+
+class WeatherRow(Row):
+    id = "weather"
+    label = "Weather location"
+    one_way = True
+    about = ("Moves the stored latitude and longitude to the centre of a square "
+             "about 1.5 miles (2.4 km) across, and keeps the name. This is "
+             "one-way: switching off does not restore the precision, because the "
+             "precise figures are not kept anywhere.")
+
+    def check(self, ctx, rec=None):
+        try:
+            text, data = load_json(ctx.weather)
+        except ActionError as exc:
+            return result("partial", "unreadable", str(exc))
+        if data is None:
+            return result("na", "no stored location",
+                          "No location is stored, so the weather panel works one out "
+                          "from your IP address. There is nothing to round.")
+        if not isinstance(data, dict):
+            return result("partial", "unreadable", "weather.json is not an object.")
+        lat, lon = data.get("latitude"), data.get("longitude")
+        if not (is_coordinate(lat) and is_coordinate(lon)):
+            return result("na", "name only", "The stored location has no coordinates to round.")
+        if on_grid(lat, lon):
+            return result("in", "rounded", self.about)
+        return result("out", "precise", self.about)
+
+    def apply(self, ctx, chk, rec):
+        text, data = load_json(ctx.weather)
+        if not isinstance(data, dict):
+            return
+        lat, lon = data.get("latitude"), data.get("longitude")
+        if not (is_coordinate(lat) and is_coordinate(lon)):
+            return
+        data["latitude"], data["longitude"] = snap_location(float(lat), float(lon))
+        atomic_write(ctx.weather, dump_like(text, data))
+
+    def revert(self, ctx, rec):
+        return  # one-way by design; see `about`
+
+
+def agents_entry(data):
+    layout = ((data or {}).get("bar") or {}).get("layout") or {}
+    for section in ("left", "center", "right"):
+        for entry in layout.get(section) or []:
+            if isinstance(entry, dict) and entry.get("id") == AGENTS_ID:
+                return entry
+    return None
+
+
+def provider_enabled(providers, name):
+    p = providers.get(name) if isinstance(providers, dict) else None
+    return not (isinstance(p, dict) and p.get("enabled") is False)
+
+
+def claude_owned(ctx):
+    """True while the Claude usage check row is switched on. That row then
+    decides Claude's value in the Agents panel, and the Agents row leaves it
+    alone."""
+    return ctx.state is not None and intended(ctx.state, BY_ID["claude-usage"])
+
+
+class AgentsRow(Row):
+    id = "agents"
+    label = "Agents panel"
+    about = ("Leaves Claude on in Omarchy's Agents panel and turns Codex and "
+             "Fireworks off, so the panel does not ask their services for usage "
+             "you do not have.")
+
+    def wanted(self, ctx):
+        if claude_owned(ctx):
+            return {n: w for n, w in AGENTS_WANTED.items() if n != "claude"}
+        return AGENTS_WANTED
+
+    def check(self, ctx, rec=None):
+        try:
+            _, data = load_json(ctx.shell_json)
+        except ActionError as exc:
+            return result("partial", "unreadable", str(exc))
+        entry = agents_entry(data)
+        if entry is None:
+            return result("na", "not on the bar", "The Agents widget is not on the bar.")
+        providers = entry.get("providers") or {}
+        on = [n for n in AGENTS_WANTED if provider_enabled(providers, n)]
+        if all(provider_enabled(providers, n) == want for n, want in self.wanted(ctx).items()):
+            return result("in", "Claude only" if on else "none", self.about)
+        return result("out", ", ".join(n.capitalize() for n in on) or "none", self.about)
+
+    def providers_for(self, entry, wanted):
+        providers = dict(entry.get("providers") or {})
+        for name, on in wanted.items():
+            p = dict(providers.get(name) or {})
+            p["enabled"] = on
+            providers[name] = p
+        return providers
+
+    def set(self, ctx, wanted):
+        _, data = load_json(ctx.shell_json)
+        entry = agents_entry(data)
+        if entry is None:
+            return
+        providers = self.providers_for(entry, wanted)
+        # The shell holds shell.json in memory and writes it back itself, so
+        # the change goes through the shell when it is running. The file is
+        # edited directly only if that did not take.
+        ctx.run(["omarchy", "bar", "set", AGENTS_ID, "providers",
+                 json.dumps(providers), "--json"], timeout=15)
+        text, data = load_json(ctx.shell_json)
+        entry = agents_entry(data)
+        if entry is None:
+            return
+        if all(provider_enabled(entry.get("providers") or {}, n) == w for n, w in wanted.items()):
+            return
+        entry["providers"] = self.providers_for(entry, wanted)
+        atomic_write(ctx.shell_json, dump_like(text, data))
+        ctx.run(["omarchy-shell", "shell", "reloadConfig"], timeout=10)
+
+    def apply(self, ctx, chk, rec):
+        self.set(ctx, self.wanted(ctx))
+
+    def revert(self, ctx, rec):
+        self.set(ctx, {n: True for n in self.wanted(ctx)})
+
+
+class ClaudeRow(Row):
+    id = "claude"
+    label = "Claude Code telemetry"
+    about = ("Sets DISABLE_TELEMETRY and DISABLE_ERROR_REPORTING in the env "
+             "section of ~/.claude/settings.json. Nothing else in the file is "
+             "changed.")
+
+    def check(self, ctx, rec=None):
+        if not ctx.claude_settings.parent.is_dir():
+            return result("na", "not set up", "Claude Code has no settings folder for this account.")
+        try:
+            _, data = load_json(ctx.claude_settings)
+        except ActionError as exc:
+            return result("partial", "unreadable", str(exc))
+        env = (data or {}).get("env") if isinstance(data, dict) else None
+        n = sum(1 for k in CLAUDE_KEYS if isinstance(env, dict) and env.get(k) == "1")
+        if n == len(CLAUDE_KEYS):
+            return result("in", "off", self.about)
+        return result("partial" if n else "out", "reporting" if not n else "partly off", self.about)
+
+    def apply(self, ctx, chk, rec):
+        text, data = load_json(ctx.claude_settings)
+        if data is None:
+            data = {}
+            rec["createdFile"] = True
+        if not isinstance(data, dict):
+            raise ActionError("settings.json is not an object, so it has been left alone")
+        if not isinstance(data.get("env"), dict):
+            if "env" in data:
+                raise ActionError("settings.json has an env that is not an object; left alone")
+            data["env"] = {}
+            rec["createdEnv"] = True
+        for k in CLAUDE_KEYS:
+            data["env"][k] = "1"
+        atomic_write(ctx.claude_settings, dump_like(text, data))
+
+    def revert(self, ctx, rec):
+        text, data = load_json(ctx.claude_settings)
+        if not isinstance(data, dict) or not isinstance(data.get("env"), dict):
+            return
+        env = data["env"]
+        if not any(k in env for k in CLAUDE_KEYS):
+            return
+        for k in CLAUDE_KEYS:
+            env.pop(k, None)
+        if not env and rec.get("createdEnv"):
+            del data["env"]
+        if not data and rec.get("createdFile"):
+            os.unlink(os.path.realpath(ctx.claude_settings))
+            return
+        atomic_write(ctx.claude_settings, dump_like(text, data))
+
+
+# ---------------------------------------------------------------- Bluetooth
+
+def bt_show(ctx):
+    """The default adapter as bluetoothctl reports it: a dict with pairable,
+    alias and name, or None when it did not answer."""
+    rc, out, _ = ctx.run(["bluetoothctl", "show"], timeout=5)
+    if rc != 0:
+        return None
+    info = {}
+    for line in out.splitlines():
+        m = re.match(r"^\s*(Pairable|Alias|Name):\s?(.*)$", line)
+        if m and m.group(1).lower() not in info:
+            info[m.group(1).lower()] = m.group(2).strip()
+    if "pairable" not in info:
+        return None
+    info["pairable"] = info["pairable"] == "yes"
+    return info
+
+
+def bt_adapters(ctx):
+    try:
+        return sorted(n for n in os.listdir(ctx.sys / "class" / "bluetooth") if n.startswith("hci"))
+    except OSError:
+        return []
+
+
+def pair_until(ctx):
+    try:
+        return int((read_text(ctx.pair_file) or "0").strip() or 0)
+    except ValueError:
+        return 0
+
+
+BT_UNIT_TEXT = """\
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# BlueZ makes an adapter pairable again whenever it starts one, so this turns
+# pairing off at login and whenever an adapter appears.
+[Unit]
+Description=Black Ops: keep the Bluetooth adapter from accepting pairing
+After=bluetooth.target bt-agent.service
+ConditionPathIsDirectory=/sys/class/bluetooth
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet bluetooth.service
+ExecStartPre=/usr/bin/sleep 2
+ExecStart=/usr/bin/bluetoothctl --timeout 10 pairable off
+
+[Install]
+WantedBy=graphical-session.target bluetooth.target
+"""
+
+
+class BluetoothRow(Row):
+    id = "bluetooth"
+    label = "Bluetooth pairing"
+    about = ("Keeps the adapter from accepting pairing, since Omarchy's pairing agent "
+             "accepts any request without asking, and names it \"laptop\" instead of "
+             "your host name. Use Pair for 60 seconds to pair something new.")
+
+    def check(self, ctx, rec=None):
+        if not bt_adapters(ctx):
+            return result("na", "no adapter", "This machine has no Bluetooth adapter.")
+        rc, _, _ = ctx.run(["systemctl", "is-active", "--quiet", "bluetooth.service"], timeout=5)
+        if rc != 0:
+            return result("na", "service not running",
+                          "The Bluetooth service is not running, so nothing can pair.")
+        info = bt_show(ctx)
+        if info is None:
+            return result("unknown", "could not be read", self.about,
+                          attention="bluetoothctl did not answer, so Black Ops cannot "
+                                    "confirm whether the adapter accepts pairing.")
+        now = int(time.time())
+        until = pair_until(ctx)
+        if info["pairable"]:
+            if until > now:
+                return result("in", f"open for pairing, {until - now} s left", self.about)
+            if until and now - until < PAIR_GRACE:
+                return result("partial", "pair window overran", self.about,
+                              attention="The 60-second pair window should have closed, and "
+                                        "the adapter still accepts pairing. The watchdog "
+                                        "turns it off at its next check, or switch on again.")
+            return result("out", "pairable", self.about,
+                          why="The adapter accepts pairing requests from anyone in range, "
+                              "and the agent accepts them without asking.")
+        if info.get("alias") != BT_ALIAS:
+            return result("partial", "not pairable, own name", self.about, core=True,
+                          why="The adapter is not pairable, but it still announces itself "
+                              "under its own name rather than \"laptop\".")
+        if not ctx.bt_unit.is_file():
+            return result("in", "not pairable", self.about,
+                          attention="The login service that keeps pairing off after a restart "
+                                    "is missing, so the adapter will be pairable again after "
+                                    "the next boot. Switch on again to put it back.")
+        return result("in", "not pairable", self.about)
+
+    def bluetoothctl(self, ctx, *args):
+        rc, _, err = ctx.run(["bluetoothctl", "--timeout", "10", *args], timeout=20)
+        if rc != 0:
+            raise ActionError(f"bluetoothctl {' '.join(args[:1])} failed: "
+                              f"{(err or '').strip()[:120] or 'no answer'}")
+
+    def apply(self, ctx, chk, rec):
+        info = bt_show(ctx)
+        if info is None:
+            raise ActionError("bluetoothctl did not answer")
+        if info.get("alias") != BT_ALIAS:
+            if "alias" not in rec and "aliasDefault" not in rec:
+                # Kept so that switching off gives back exactly the name it had.
+                if info.get("alias") == info.get("name"):
+                    rec["aliasDefault"] = True
+                else:
+                    rec["alias"] = info.get("alias", "")
+            self.bluetoothctl(ctx, "system-alias", BT_ALIAS)
+        if info["pairable"] and pair_until(ctx) <= int(time.time()):
+            self.bluetoothctl(ctx, "pairable", "off")
+        if read_text(ctx.bt_unit) != BT_UNIT_TEXT:
+            atomic_write(ctx.bt_unit, BT_UNIT_TEXT)
+            ctx.run(["systemctl", "--user", "daemon-reload"], timeout=15)
+        ctx.run(["systemctl", "--user", "enable", BT_UNIT], timeout=15)
+
+    def revert(self, ctx, rec):
+        ctx.run(["systemctl", "--user", "stop", PAIR_UNIT + ".timer"], timeout=10)
+        with contextlib.suppress(FileNotFoundError):
+            ctx.pair_file.unlink()
+        if ctx.bt_unit.exists():
+            ctx.run(["systemctl", "--user", "disable", BT_UNIT], timeout=15)
+            ctx.bt_unit.unlink()
+            ctx.run(["systemctl", "--user", "daemon-reload"], timeout=15)
+        if "alias" in rec or "aliasDefault" in rec:
+            info = bt_show(ctx) if bt_adapters(ctx) else None
+            if info is None:
+                raise ActionError("The Bluetooth adapter is not there, so its name cannot be "
+                                  "put back yet. Switch off again once it is.")
+            if info.get("alias") == BT_ALIAS:
+                if rec.get("aliasDefault"):
+                    self.bluetoothctl(ctx, "reset-alias")
+                else:
+                    self.bluetoothctl(ctx, "system-alias", rec.get("alias", ""))
+        # Pairing is left as it is now. BlueZ makes the adapter pairable again
+        # the next time it starts one, which is how Omarchy ships.
+
+    def heal(self, ctx):
+        """Pairing that has come back on outside a pair window, such as after
+        the adapter was reset on resume, is turned off again."""
+        if not bt_adapters(ctx):
+            return False
+        info = bt_show(ctx)
+        if info is None or not info["pairable"] or pair_until(ctx) > int(time.time()):
+            return False
+        with contextlib.suppress(ActionError):
+            self.bluetoothctl(ctx, "pairable", "off")
+            return True
+        return False
+
+    def open_window(self, ctx):
+        """Make the adapter pairable for PAIR_SECONDS, and arrange for it to
+        stop being pairable afterwards whether or not the panel is still open."""
+        until = int(time.time()) + PAIR_SECONDS
+        ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_write(ctx.pair_file, f"{until}\n", mode=0o600)
+        self.bluetoothctl(ctx, "pairable", "on")
+        ctx.run(["systemctl", "--user", "stop", PAIR_UNIT + ".timer"], timeout=10)
+        cmd = [ctx.which("bluetoothctl") or "/usr/bin/bluetoothctl", "--timeout", "10",
+               "pairable", "off"]
+        rc, _, _ = ctx.run(["systemd-run", "--user", "--quiet", f"--unit={PAIR_UNIT}",
+                            "--description=Black Ops: close the Bluetooth pair window",
+                            f"--on-active={PAIR_SECONDS}", "--timer-property=AccuracySec=1s",
+                            "--collect", *cmd], timeout=15)
+        if rc != 0:
+            # No user manager to hand the timer to: a detached sleep in a
+            # session of its own, which outlives the panel.
+            subprocess.Popen(["sh", "-c", f"sleep {PAIR_SECONDS}; exec \"$0\" \"$@\"", *cmd],
+                             env=ctx.environ, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+
+
+def bt_privacy(text):
+    """(Privacy in [General] gives a private address, the plugin's marker is
+    in the file)."""
+    value = "off"
+    for section, key, v in ini_items(text):
+        if section == "General" and key == "Privacy":
+            value = v.lower()
+    return value in BT_PRIVATE, BT_PRIVACY_MARK in (text or "")
+
+
+def bt_privacy_live(ctx):
+    """Whether the kernel has privacy on for the first adapter, as btmgmt
+    reports it without root, or None when that cannot be read."""
+    if not ctx.which("btmgmt"):
+        return None
+    rc, out, _ = ctx.run(["btmgmt", "info"], timeout=5)
+    m = re.search(r"^\s*current settings:(.*)$", out, re.M) if rc == 0 else None
+    if not m:
+        return None
+    # "ll-privacy" is the controller's address resolution, a different flag.
+    return "privacy" in m.group(1).split()
+
+
+def bt_pairing_back_off(ctx):
+    """Restarting bluetoothd makes the adapter pairable again. When the
+    Bluetooth pairing row is in place, its login service is run now as at
+    login, and pairing is turned off directly if it is still on."""
+    if not ctx.bt_unit.is_file() or pair_until(ctx) > int(time.time()):
+        return
+    ctx.run(["systemctl", "--user", "start", BT_UNIT], timeout=30)
+    BluetoothRow().heal(ctx)
+
+
+class BtPrivacyRow(Row):
+    id = "bt-privacy"
+    label = "Bluetooth address"
+    optional = True
+    privileged = True
+    about = ("Bluetooth Low Energy devices paired before this is switched on, such as some "
+             "mice, keyboards and earbuds, may not reconnect until they are paired again, and "
+             "switching it on or off restarts Bluetooth, which drops connected devices for a "
+             "few seconds. Sets Privacy=device in /etc/bluetooth/main.conf, so on Bluetooth "
+             "Low Energy the adapter uses a private address that changes over time instead "
+             "of its fixed one, and devices in range cannot follow this machine from place "
+             "to place. Devices paired afterwards are not affected, and Classic Bluetooth, "
+             "which most headphones use, keeps the fixed address.")
+
+    def check(self, ctx, rec=None):
+        if not bt_adapters(ctx):
+            return result("na", "no adapter", "This machine has no Bluetooth adapter.")
+        text = read_text(ctx.bt_main_conf)
+        if text is None:
+            return result("na", "not installed", "BlueZ is not installed.")
+        on, ours = bt_privacy(text)
+        if on:
+            value = "private address" if ours else "private address, by hand"
+            rc, _, _ = ctx.run(["systemctl", "is-active", "--quiet", "bluetooth.service"],
+                               timeout=5)
+            if rc == 0 and bt_privacy_live(ctx) is False:
+                return result("in", value, self.about, attention=(
+                    "Privacy is set in main.conf, but Bluetooth has not restarted since, so "
+                    "the adapter still uses its fixed address. Restart Bluetooth or the "
+                    "machine to apply it."))
+            return result("in", value, self.about)
+        if ours:
+            return result("partial", "overridden", self.about,
+                          why="The marked line is there, but a later Privacy line in "
+                              "[General] turns the private address off again.")
+        return result("out", "fixed address", self.about,
+                      why="The adapter uses its fixed address, so any Bluetooth device in "
+                          "range can recognise this machine wherever it goes.")
+
+    def apply(self, ctx, chk, rec):
+        if not ctx.helper("bt-privacy-on").endswith(": unchanged"):
+            bt_pairing_back_off(ctx)
+
+    def revert(self, ctx, rec):
+        if bt_privacy(read_text(ctx.bt_main_conf))[1]:
+            if not ctx.helper("bt-privacy-off").endswith(": unchanged"):
+                bt_pairing_back_off(ctx)
+
+
+# --------------------------------------------------------- NetworkManager
+
+def ini_items(text):
+    """(section, key, value) for each setting in an ini-style file, in order."""
+    section = None
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s[0] in "#;":
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip()
+            continue
+        if "=" in s and section is not None:
+            k, v = s.split("=", 1)
+            yield section, k.strip(), v.strip()
+
+
+def nm_config(ctx):
+    """Every setting NetworkManager reads from its configuration files, in
+    the order it reads them, so that the last value for a key is the one in
+    effect. NetworkManager prints this itself with --print-config, which
+    works as an ordinary user; when it cannot, the files are read the same
+    way: NetworkManager.conf, then conf.d files from /usr/lib, /run and /etc
+    sorted by name, a name in /etc hiding the same name elsewhere. Neither
+    way sees /var/lib/NetworkManager/NetworkManager-intern.conf, which only
+    root can read."""
+    if ctx.which("NetworkManager"):
+        rc, out, _ = ctx.run(["NetworkManager", "--print-config"], timeout=5)
+        if rc == 0 and out.strip():
+            return list(ini_items(out))
+    items = list(ini_items(read_text(ctx.nm_dir / "NetworkManager.conf")))
+    by_name = {}
+    for d in (ctx.usr_lib / "NetworkManager/conf.d", ctx.run_dir / "NetworkManager/conf.d",
+              ctx.nm_dir / "conf.d"):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".conf") and not n.startswith("."):
+                by_name[n] = d / n
+    for n in sorted(by_name):
+        items.extend(ini_items(read_text(by_name[n])))
+    return items
+
+
+def nm_normal(key, value):
+    v = (value or "").strip().lower()
+    if key.endswith("dhcp-send-hostname"):
+        return {"0": "false", "no": "false", "off": "false", "false": "false",
+                "1": "true", "yes": "true", "on": "true", "true": "true"}.get(v, v)
+    return v
+
+
+def permanent_mac_devices(ctx):
+    """Connected Wi-Fi and Ethernet devices still using their hardware MAC
+    address, which with a stable cloned address means they connected before
+    the setting was made."""
+    out = []
+    base = ctx.sys / "class" / "net"
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for name in names:
+        d = base / name
+        if not (d / "device").exists():
+            continue
+        vals = {k: (read_text(d / k) or "").strip() for k in ("type", "operstate", "addr_assign_type")}
+        if vals["type"] == "1" and vals["operstate"] == "up" and vals["addr_assign_type"] == "0":
+            out.append(name)
+    return out
+
+
+def nm_profile_overrides(ctx):
+    """How many Wi-Fi and Ethernet connection profiles set one of the
+    identity settings themselves, so that the defaults in the drop-in do not
+    reach them. Asked of NetworkManager with nmcli, which works as an
+    ordinary user; 0 when nmcli is not there or does not answer. Profile
+    names are never reported, since a Wi-Fi name can say where you have been."""
+    if not ctx.which("nmcli"):
+        return 0
+    rc, out, _ = ctx.run(["nmcli", "-t", "-f", "UUID,TYPE", "connection", "show"], timeout=5)
+    if rc != 0:
+        return 0
+    fields = ("ipv4.dhcp-send-hostname", "ipv6.dhcp-send-hostname", "ipv6.ip6-privacy")
+    n = 0
+    for line in out.splitlines():
+        uuid, _, kind = line.partition(":")
+        if kind not in ("802-11-wireless", "802-3-ethernet") or not re.fullmatch(r"[0-9a-f-]{36}", uuid):
+            continue
+        mac = "802-11-wireless.cloned-mac-address" if kind == "802-11-wireless" \
+            else "802-3-ethernet.cloned-mac-address"
+        rc, vals, _ = ctx.run(["nmcli", "-g", ",".join(fields + (mac,)), "connection", "show", uuid],
+                              timeout=5)
+        if rc != 0:
+            continue
+        v = [x.strip().lower() for x in vals.splitlines()]
+        v += [""] * (4 - len(v))
+        send4, send6, privacy, cloned = v[:4]
+        if send4 in ("1", "yes", "true") or send6 in ("1", "yes", "true") \
+                or privacy in ("0", "1", "disabled", "enabled, prefer public address") \
+                or cloned in ("permanent", "preserve"):
+            n += 1
+    return n
+
+
+class IdentityRow(Row):
+    id = "identity"
+    label = "Network identity"
+    privileged = True
+    about = ("A NetworkManager drop-in stops sending the host name in DHCP requests, "
+             "uses a stable per-network MAC address instead of the hardware one, and "
+             "prefers IPv6 temporary addresses. It applies when a network next connects.")
+
+    def check(self, ctx, rec=None):
+        if not ctx.nm_dir.is_dir():
+            return result("na", "no NetworkManager", "NetworkManager is not installed.")
+        eff, device = {}, set()
+        for section, key, value in nm_config(ctx):
+            if key not in IDENTITY_WANTED:
+                continue
+            if section == "connection":
+                eff[key] = value
+            elif section.startswith("connection") and \
+                    nm_normal(key, value) != IDENTITY_WANTED[key]:
+                device.add(key)
+        good = [k for k, want in IDENTITY_WANTED.items() if nm_normal(k, eff.get(k)) == want]
+        missing = [k for k in IDENTITY_WANTED if k not in good]
+        ours = ctx.identity_dropin.is_file()
+        if not missing:
+            value = "in place" if ours else "in place by hand"
+            if device:
+                return result("in", value, self.about, attention=(
+                    "A device-specific [connection-...] section sets "
+                    + ", ".join(sorted(device)) + " differently, so Black Ops cannot confirm "
+                    "the identity for every device."))
+            own = nm_profile_overrides(ctx)
+            if own:
+                return result("in", value, self.about, attention=(
+                    f"{own} connection profile" + (" sets" if own == 1 else "s set")
+                    + " the host name, the MAC address or IPv6 privacy itself, so the "
+                    "defaults do not reach " + ("it" if own == 1 else "them") + ". Set "
+                    "those to their default in the profile, for example with nmcli."))
+            waiting = permanent_mac_devices(ctx)
+            if waiting:
+                return result("in", value, self.about, attention=(
+                    f"{', '.join(waiting)} still uses its hardware MAC address. The new "
+                    "identity applies when it next connects: switch Wi-Fi off and on, or "
+                    "reconnect. If it stays like this, its connection profile sets its own "
+                    "MAC address."))
+            return result("in", value, self.about)
+        if ours:
+            return result("partial", "overridden", self.about,
+                          why="The drop-in is there, but a file read after it sets "
+                              + ", ".join(missing) + " differently, so it is not in effect.")
+        if good:
+            return result("out", f"{len(good)} of {len(IDENTITY_WANTED)} set", self.about,
+                          why="Only some of the five settings are in place, so the host name "
+                              "or the hardware MAC address can still reach the network.")
+        return result("out", "hardware MAC, host name sent", self.about,
+                      why="Every network sees the hardware MAC address and the host name.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("identity-on")
+
+    def revert(self, ctx, rec):
+        if ctx.identity_dropin.exists():
+            ctx.helper("identity-off")
+
+
+class ConnectivityRow(Row):
+    id = "connectivity"
+    label = "Connectivity check"
+    privileged = True
+    about = ("Stops NetworkManager fetching ping.archlinux.org on every connection change "
+             "and every few minutes. Captive portals, such as hotel Wi-Fi sign-in pages, "
+             "are then not detected by themselves; open any web page to reach them.")
+
+    def check(self, ctx, rec=None):
+        if not ctx.nm_dir.is_dir():
+            return result("na", "no NetworkManager", "NetworkManager is not installed.")
+        cfg = {}
+        for section, key, value in nm_config(ctx):
+            if section == "connectivity":
+                cfg[key] = value
+        by_config = bool(cfg.get("uri")) and nm_normal("x", cfg.get("enabled", "true")) not in (
+            "false", "no", "0", "off") and cfg.get("interval", "") != "0"
+        runtime = None
+        if ctx.which("busctl"):
+            rc, out, _ = ctx.run(["busctl", "get-property", "org.freedesktop.NetworkManager",
+                                  "/org/freedesktop/NetworkManager",
+                                  "org.freedesktop.NetworkManager", "ConnectivityCheckEnabled"],
+                                 timeout=5)
+            m = re.match(r"^b (true|false)$", out.strip()) if rc == 0 else None
+            if m:
+                runtime = m.group(1) == "true"
+        enabled = by_config if runtime is None else runtime
+        ours = ctx.connectivity_dropin.is_file()
+        if not enabled:
+            if runtime is not None and by_config:
+                return result("in", "off, set over D-Bus", self.about + (
+                    " It was switched off over D-Bus, which NetworkManager keeps in "
+                    "/var/lib/NetworkManager/NetworkManager-intern.conf, a file only root can "
+                    "read. That is left as it is."))
+            return result("in", "off" if ours else "off by hand", self.about)
+        if ours:
+            return result("partial", "overridden", self.about,
+                          why="The drop-in is there, but NetworkManager still checks. A file read "
+                              "after it, or a setting made over D-Bus, turns it back on.")
+        return result("out", "checking", self.about,
+                      why="NetworkManager contacts ping.archlinux.org whenever the network "
+                          "changes.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("connectivity-on")
+
+    def revert(self, ctx, rec):
+        if ctx.connectivity_dropin.exists():
+            ctx.helper("connectivity-off")
+
+
+# ------------------------------------------------------------------ Chromium
+
+def same_json(a, b):
+    """Equal as JSON, so that false is not taken for 0."""
+    return type(a) is type(b) and a == b
+
+
+class ChromiumRow(Row):
+    id = "chromium"
+    label = "Chromium privacy policy"
+    privileged = True
+    about = ("Casting from Chromium stops working, the address bar stops suggesting "
+             "searches, pages are no longer preloaded, and a site that needs third-party "
+             "cookies, such as some embedded sign-ins, may not work. A managed policy turns "
+             "off search suggestions, preloading, Google's error pages, the spelling service, "
+             "usage reports, third-party cookies, Privacy Sandbox ads, the password leak "
+             "check, running in the background and the search for Cast devices on the local "
+             "network, and keeps WebRTC to the public interface. Safe Browsing and updates "
+             "are left as they are.")
+
+    def check(self, ctx, rec=None):
+        ours_path = ctx.chromium_policies / CHROMIUM_POLICY_NAME
+        if not ctx.which("chromium") and not ours_path.exists():
+            return result("na", "not installed", "Chromium is not installed.")
+        seen = {}
+        try:
+            names = sorted(n for n in os.listdir(ctx.chromium_policies) if n.endswith(".json"))
+        except OSError:
+            names = []
+        ours = None
+        for name in names:
+            try:
+                _, data = load_json(ctx.chromium_policies / name)
+            except ActionError:
+                data = None
+            if not isinstance(data, dict):
+                continue
+            if name == CHROMIUM_POLICY_NAME:
+                ours = data
+            for key, _ in CHROMIUM_POLICIES:
+                if key in data:
+                    seen.setdefault(key, []).append((name, data[key]))
+        if ours is not None and not any(k in ours for k in CHROMIUM_NEW) and \
+                all(same_json(ours.get(k), v) for k, v in CHROMIUM_POLICIES if k not in CHROMIUM_NEW):
+            return result("out", "policies to add", self.about, new=True,
+                          why=f"{CHROMIUM_POLICY_NAME} is from an earlier version of Black Ops, "
+                              "so Chromium still searches the local network for Cast devices.")
+        if ours is not None and not all(same_json(ours.get(k), v) for k, v in CHROMIUM_POLICIES):
+            return result("partial", "altered", self.about,
+                          why=f"{CHROMIUM_POLICY_NAME} has been changed, so some of these "
+                              "policies are no longer set.")
+        held = [k for k, v in CHROMIUM_POLICIES
+                if any(same_json(val, v) for _, val in seen.get(k, []))]
+        clash = sorted({name for k, v in CHROMIUM_POLICIES for name, val in seen.get(k, [])
+                        if not same_json(val, v)})
+        if len(held) == len(CHROMIUM_POLICIES):
+            value = "in place" if ours is not None else "in place by hand"
+            if clash:
+                return result("in", value, self.about, attention=(
+                    ", ".join(clash) + " sets some of the same policies differently. Chromium "
+                    "then uses only one of them, so Black Ops cannot confirm which applies."))
+            return result("in", value, self.about)
+        if held:
+            # Set by hand to what an earlier version wrote: the rest is new.
+            older = [k for k, _ in CHROMIUM_POLICIES if k not in CHROMIUM_NEW]
+            return result("out", f"{len(held)} of {len(CHROMIUM_POLICIES)} set", self.about,
+                          new=held == older,
+                          why="Only some of these policies are set, so Chromium still sends "
+                              "what the others would stop.")
+        return result("out", "Chromium defaults", self.about,
+                      why="Chromium sends what you type in the address bar for suggestions, "
+                          "preloads pages, and allows third-party cookies.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("chromium-on")
+
+    def revert(self, ctx, rec):
+        if (ctx.chromium_policies / CHROMIUM_POLICY_NAME).exists():
+            ctx.helper("chromium-off")
+
+
+# --------------------------------------------------------------------- avahi
+
+def avahi_publishing(text):
+    """(disable-publishing is yes, the plugin's marker is in the file)."""
+    value = "no"
+    section = None
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip()
+            continue
+        if section == "publish" and s and s[0] not in "#;" and "=" in s:
+            k, v = s.split("=", 1)
+            if k.strip() == AVAHI_KEY:
+                value = v.strip().lower()
+    return value == "yes", AVAHI_MARK in (text or "")
+
+
+def avahi_masked(ctx):
+    """The Avahi units masked in /etc/systemd/system."""
+    out = []
+    for unit in AVAHI_UNITS:
+        p = ctx.system_units / unit
+        if p.is_symlink() and os.readlink(p) == "/dev/null":
+            out.append(unit)
+    return out
+
+
+class AvahiRow(Row):
+    id = "avahi"
+    label = "Avahi announcements"
+    privileged = True
+    about = ("Stops Avahi announcing this machine's host name, addresses and services to "
+             "everyone on the local network, by setting disable-publishing=yes in "
+             "avahi-daemon.conf. Finding printers and other machines still works.")
+
+    def check(self, ctx, rec=None):
+        text = read_text(ctx.avahi_conf)
+        if text is None:
+            return result("na", "not installed", "Avahi is not installed.")
+        off, ours = avahi_publishing(text)
+        if off:
+            return result("in", "not announcing" if ours else "not announcing, by hand", self.about)
+        if len(avahi_masked(ctx)) == len(AVAHI_UNITS):
+            return result("na", "daemon masked", "The Avahi daemon is masked, so it announces "
+                                                   "nothing whatever this setting says.")
+        if ours:
+            return result("partial", "overridden", self.about,
+                          why="The marked line is there, but a later line in [publish] turns "
+                              "announcing back on.")
+        return result("out", "announcing", self.about,
+                      why="Avahi tells every device on the local network this machine's host "
+                          "name and addresses.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("avahi-on")
+
+    def revert(self, ctx, rec):
+        if avahi_publishing(read_text(ctx.avahi_conf))[1]:
+            ctx.helper("avahi-off")
+
+
+# ------------------------------------------------------------------ web apps
+
+WEBAPP_WRAPPER_TEXT = """\
+#!/bin/bash
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# Opens an Omarchy web app in a browser profile of its own, one for each
+# site, so that web apps share no cookies or logins with each other or with
+# your main browser. Everything else is left to Omarchy's own launcher.
+url=${1:-}
+host=${url#*://}
+host=${host%%[/?#]*}
+host=${host##*@}
+host=${host%%:*}
+host=${host,,}
+host=${host#www.}
+name=${host//[^a-z0-9.-]/_}
+[[ -n $name && $name != . && $name != .. ]] || name=default
+dir="${XDG_DATA_HOME:-$HOME/.local/share}/black-ops-webapps/$name"
+for real in "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-launch-webapp" /usr/bin/omarchy-launch-webapp; do
+  [[ -x $real ]] && break
+done
+[[ -x $real ]] || real=omarchy-launch-webapp
+(($#)) || exec "$real"
+exec "$real" "$url" --user-data-dir="$dir" --no-first-run --no-default-browser-check "${@:2}"
+"""
+
+
+def desktop_main(lines):
+    """(start, end) of the [Desktop Entry] group's lines in a .desktop file."""
+    start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if start is not None:
+                return start, i
+            if s == "[Desktop Entry]":
+                start = i + 1
+    return (start, len(lines)) if start is not None else (None, None)
+
+
+def desktop_exec_program(value):
+    """The program an Exec= value runs, with the spec's quoting undone."""
+    v = value.strip()
+    if v.startswith('"'):
+        m = re.match(r'^"((?:[^"\\]|\\.)*)"', v)
+        return re.sub(r"\\(.)", r"\1", m.group(1)) if m else ""
+    return v.split(None, 1)[0] if v else ""
+
+
+def desktop_quote(path):
+    if re.fullmatch(r"[A-Za-z0-9/._+-]+", path):
+        return path
+    return '"' + re.sub(r'(["`$\\])', r"\\\1", path) + '"'
+
+
+def webapp_files(ctx):
+    """[(path, lines, exec index, mark index or None)] for every .desktop file
+    in ~/.local/share/applications that launches a web app through Omarchy or
+    that this plugin changed."""
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(ctx.applications) if n.endswith(".desktop"))
+    except OSError:
+        return out
+    for name in names:
+        path = ctx.applications / name
+        text = read_text(path)
+        if text is None:
+            continue
+        lines = text.split("\n")
+        start, end = desktop_main(lines)
+        if start is None:
+            continue
+        ex = mark = None
+        for i in range(start, end):
+            if lines[i].startswith("Exec=") and ex is None:
+                ex = i
+            elif lines[i].startswith(WEBAPP_MARK + "="):
+                mark = i
+        if ex is None:
+            continue
+        program = os.path.basename(desktop_exec_program(lines[ex][5:]))
+        if mark is not None or program == WEBAPP_LAUNCHER:
+            out.append((path, lines, ex, mark))
+    return out
+
+
+class WebappsRow(Row):
+    id = "webapps"
+    label = "Web app profiles"
+    about = ("Opens each Omarchy web app in a browser profile of its own, one for each "
+             "site, so web apps share no cookies or logins with each other or with your "
+             "main browser. Each one asks you to sign in once more the first time. "
+             "This covers web apps started from the app launcher. Omarchy's keyboard "
+             "shortcuts for web apps, such as Super+Shift+A, call Omarchy's launcher "
+             "directly, and still open in the main profile.")
+
+    def check(self, ctx, rec=None):
+        files = webapp_files(ctx)
+        if not files:
+            return result("na", "no web apps", "No Omarchy web apps are installed.")
+        wrapper_ok = read_text(ctx.webapp_wrapper) == WEBAPP_WRAPPER_TEXT and \
+            os.access(ctx.webapp_wrapper, os.X_OK)
+        wrapped = [f for f in files if f[3] is not None]
+        plain = [f for f in files if f[3] is None and "--user-data-dir" not in f[1][f[2]]]
+        if wrapped and not wrapper_ok:
+            return result("partial", "launcher missing", self.about,
+                          why="The Black Ops launcher these web apps now start through is "
+                              "missing or changed, so they may not open. Switch on again.")
+        n = len(files)
+        if not plain:
+            return result("in", f"{n} web app" + ("s" if n != 1 else ""), self.about)
+        if len(plain) < n:
+            return result("partial", f"{len(plain)} of {n} share a profile", self.about,
+                          why=f"{len(plain)} web app" + (" uses" if len(plain) == 1 else "s use")
+                              + " the main browser profile, with its cookies and logins. A web "
+                              "app installed or reinstalled since is the usual cause.")
+        return result("out", "sharing the main profile", self.about,
+                      why="Every web app shares the main browser profile, so each site can "
+                          "see the cookies and logins the others use.")
+
+    def apply(self, ctx, chk, rec):
+        if read_text(ctx.webapp_wrapper) != WEBAPP_WRAPPER_TEXT:
+            atomic_write(ctx.webapp_wrapper, WEBAPP_WRAPPER_TEXT, mode=0o755)
+        os.chmod(ctx.webapp_wrapper, 0o755)
+        launcher = desktop_quote(str(ctx.webapp_wrapper))
+        for path, lines, ex, mark in webapp_files(ctx):
+            if mark is not None or "--user-data-dir" in lines[ex]:
+                continue
+            original = lines[ex][5:]
+            v = original.strip()
+            rest = ""
+            if v.startswith('"'):
+                m = re.match(r'^"((?:[^"\\]|\\.)*)"(.*)$', v)
+                rest = m.group(2) if m else ""
+            else:
+                parts = v.split(None, 1)
+                rest = " " + parts[1] if len(parts) > 1 else ""
+            lines[ex] = "Exec=" + launcher + rest
+            lines.insert(ex + 1, f"{WEBAPP_MARK}={original}")
+            atomic_write(path, "\n".join(lines))
+
+    def revert(self, ctx, rec):
+        for path, lines, ex, mark in webapp_files(ctx):
+            if mark is None:
+                continue
+            lines[ex] = "Exec=" + lines[mark][len(WEBAPP_MARK) + 1:]
+            del lines[mark]
+            atomic_write(path, "\n".join(lines))
+        with contextlib.suppress(FileNotFoundError):
+            ctx.webapp_wrapper.unlink()
+        for d in (ctx.webapp_wrapper.parent, ctx.webapp_wrapper.parent.parent):
+            with contextlib.suppress(OSError):
+                d.rmdir()
+        # The profiles themselves hold your logins for these sites, so they
+        # are kept; ~/.local/share/black-ops-webapps can be deleted by hand.
+
+
+# ------------------------------------------------------------ optional rows
+
+def bar_entry(data, widget_id):
+    """(section, index, entry) of a widget on the bar, or None."""
+    layout = ((data or {}).get("bar") or {}).get("layout") or {}
+    for section in ("left", "center", "right"):
+        for i, entry in enumerate(layout.get(section) or []):
+            if isinstance(entry, dict) and entry.get("id") == widget_id:
+                return section, i, entry
+    return None
+
+
+class UpdateBadgeRow(Row):
+    id = "update-badge"
+    label = "Update badge"
+    optional = True
+    about = ("Takes Omarchy's update badge off the bar. The badge runs checkupdates every "
+             "six hours, which downloads the package lists from your mirror. You then "
+             "check for updates yourself, from the Omarchy menu or with omarchy-update.")
+
+    def check(self, ctx, rec=None):
+        try:
+            _, data = load_json(ctx.shell_json)
+        except ActionError as exc:
+            return result("unknown", "unreadable", str(exc), attention=str(exc))
+        if bar_entry(data, UPDATE_BADGE_ID):
+            return result("out", "on the bar", self.about,
+                          why="The badge is back on the bar and checks for updates every six hours.")
+        if rec and rec.get("section"):
+            return result("in", "off the bar", self.about)
+        return result("na", "not on the bar", "The update badge is not on the bar.")
+
+    def apply(self, ctx, chk, rec):
+        _, data = load_json(ctx.shell_json)
+        found = bar_entry(data, UPDATE_BADGE_ID)
+        if not found:
+            return
+        section, index, entry = found
+        rec.update({"section": section, "index": index, "entry": entry})
+        # Through the shell first, which writes shell.json itself; directly
+        # only when that did not take, as for the Agents row.
+        ctx.run(["omarchy", "plugin", "disable", UPDATE_BADGE_ID], timeout=15)
+        text, data = load_json(ctx.shell_json)
+        found = bar_entry(data, UPDATE_BADGE_ID)
+        if not found:
+            return
+        del data["bar"]["layout"][found[0]][found[1]]
+        atomic_write(ctx.shell_json, dump_like(text, data))
+        ctx.run(["omarchy-shell", "shell", "reloadConfig"], timeout=10)
+
+    def revert(self, ctx, rec):
+        section, index, entry = rec.get("section"), rec.get("index"), rec.get("entry")
+        if section not in ("left", "center", "right") or not isinstance(index, int):
+            return
+        if not isinstance(entry, dict) or entry.get("id") != UPDATE_BADGE_ID:
+            entry = {"id": UPDATE_BADGE_ID}
+        _, data = load_json(ctx.shell_json)
+        if data is None or bar_entry(data, UPDATE_BADGE_ID):
+            return
+        ctx.run(["omarchy", "plugin", "enable", UPDATE_BADGE_ID, "--section", section,
+                 "--index", str(index)], timeout=15)
+        text, data = load_json(ctx.shell_json)
+        found = bar_entry(data, UPDATE_BADGE_ID)
+        if found and found[2] == entry:
+            return
+        layout = data.setdefault("bar", {}).setdefault("layout", {})
+        if found:
+            layout[found[0]][found[1]] = entry
+        else:
+            items = layout.setdefault(section, [])
+            items.insert(min(index, len(items)), entry)
+        atomic_write(ctx.shell_json, dump_like(text, data))
+        ctx.run(["omarchy-shell", "shell", "reloadConfig"], timeout=10)
+
+
+class HerdrRow(Row):
+    id = "herdr"
+    label = "herdr update check"
+    privileged = True
+    optional = True
+    about = ("Sinks herdr.dev in the marked block in /etc/hosts, which stops herdr's "
+             "background version and agent-detection checks. herdr is updated with the "
+             "rest of Omarchy by pacman, and the herdr.dev website no longer opens.")
+
+    def check(self, ctx, rec=None):
+        text = read_text(ctx.hosts) or ""
+        v = hosts_view(text)
+        blocked = all(h in v["blocked"] for h in HERDR_HOSTS)
+        if not blocked and not ctx.which("herdr"):
+            return result("na", "not installed", "herdr is not installed.")
+        if v["damaged"]:
+            return result("partial", "block damaged", self.about,
+                          why="The black-ops block in /etc/hosts has a missing or extra marker.")
+        if blocked and all(h in v["block"] for h in HERDR_HOSTS):
+            return result("in", "blocked", self.about)
+        if blocked:
+            return result("in", "blocked by hand", self.about +
+                          " Switching on moves the hand-written lines into the marked block.",
+                          work=True)
+        return result("out", "checking herdr.dev", self.about,
+                      why="herdr contacts herdr.dev in the background.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("herdr-block-on")
+
+    def revert(self, ctx, rec):
+        ctx.helper("herdr-block-off")
+
+
+def localsend_rules(ctx):
+    """Which of Omarchy's two LocalSend rules ufw holds ("tcp", "udp"), or
+    None when ufw is not installed. ufw keeps its rules world-readable in
+    user.rules and user6.rules, so no root is needed to read them."""
+    found = set()
+    texts = [read_text(ctx.ufw_dir / n) for n in ("user.rules", "user6.rules")]
+    if all(t is None for t in texts):
+        return None
+    for text in texts:
+        for line in (text or "").splitlines():
+            m = LOCALSEND_TUPLE.match(line)
+            if m:
+                found.add(m.group(1))
+    return found
+
+
+def localsend_own_rule(ctx):
+    """Whether ufw holds some other rule for port 53317, such as one limited
+    to the local network."""
+    for n in ("user.rules", "user6.rules"):
+        for line in (read_text(ctx.ufw_dir / n) or "").splitlines():
+            if line.startswith("### tuple ### allow ") and " 53317 " in line \
+                    and not LOCALSEND_TUPLE.match(line):
+                return True
+    return False
+
+
+class LocalSendRow(Row):
+    id = "localsend"
+    label = "LocalSend firewall port"
+    privileged = True
+    optional = True
+    about = ("Closes port 53317, which Omarchy opens in the firewall for LocalSend to "
+             "every network you join. Others can then no longer find this machine or send "
+             "files to it; sending from it still works.")
+
+    def check(self, ctx, rec=None):
+        rules = localsend_rules(ctx)
+        if rules is None:
+            return result("na", "no ufw", "ufw is not installed.")
+        if not rules:
+            if rec is not None:
+                return result("in", "closed", self.about)
+            if localsend_own_rule(ctx):
+                return result("na", "your own rule",
+                              "Port 53317 is open only where a rule of your own allows it, "
+                              "such as your local network. Black Ops leaves that rule alone.")
+            return result("na", "rule not present",
+                          "Omarchy's LocalSend rule is not in the firewall, so there is "
+                          "nothing to close. A rule of your own is left alone.")
+        if len(rules) == 2:
+            return result("out", "open to any network", self.about,
+                          why="Port 53317 is open to every network, for TCP and UDP.")
+        return result("partial", f"open for {'/'.join(sorted(rules)).upper()}", self.about,
+                      why="Port 53317 is still open for " + "/".join(sorted(rules)).upper() + ".")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("localsend-close")
+
+    def revert(self, ctx, rec):
+        if rec.get("how") == "applied":
+            ctx.helper("localsend-open")
+
+
+# ------------------------------------------------------- developer tools
+
+TOML_HEADER = re.compile(r"^\s*\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(?:#.*)?$")
+
+
+def toml_value(text, table, key):
+    """The value of `key` in `[table]`, or None. Raises ActionError when the
+    file is not valid TOML, since editing it would be a guess."""
+    try:
+        data = tomllib.loads(text or "")
+    except tomllib.TOMLDecodeError:
+        raise ActionError("a TOML file is not valid, so it has been left alone")
+    section = data.get(table)
+    return section.get(key) if isinstance(section, dict) else None
+
+
+def toml_literal(literal):
+    return tomllib.loads(f"v = {literal}")["v"]
+
+
+def toml_table_bounds(lines, table):
+    """(header index, end index) of a plain `[table]` header and its lines,
+    or None."""
+    for i, line in enumerate(lines):
+        m = TOML_HEADER.match(line)
+        if m and m.group(1) == table:
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                if lines[j].lstrip().startswith("["):
+                    end = j
+                    break
+            return i, end
+    return None
+
+
+def toml_key_line(lines, start, end, key):
+    pat = re.compile(r"^\s*" + re.escape(key) + r"\s*=")
+    for j in range(start, end):
+        if pat.match(lines[j]):
+            return j
+    return None
+
+
+def toml_set(text, table, key, literal):
+    """`text` with `key = literal` in `[table]`, changed line by line so that
+    every other line, comment and blank stays exactly as it was. Returns the
+    new text and what revert needs to put the old text back."""
+    lines = (text or "").split("\n")
+    info = {}
+    b = toml_table_bounds(lines, table)
+    if b is None:
+        body = (text or "")
+        if body and not body.endswith("\n"):
+            body += "\n"
+        if body.strip():
+            body += "\n"
+        new = body + f"[{table}]\n{key} = {literal}\n"
+        info["createdTable"] = True
+    else:
+        h, end = b
+        j = toml_key_line(lines, h + 1, end, key)
+        if j is not None:
+            info["oldLine"] = lines[j]
+            indent = re.match(r"^\s*", lines[j]).group(0)
+            lines[j] = f"{indent}{key} = {literal}"
+        else:
+            at = h + 1
+            for k in range(h + 1, end):
+                if lines[k].strip():
+                    at = k + 1
+            lines.insert(at, f"{key} = {literal}")
+        new = "\n".join(lines)
+    if not same_json(toml_value(new, table, key), toml_literal(literal)):
+        raise ActionError(f"{key} could not be set in [{table}] without a guess; left alone")
+    return new, info
+
+
+def toml_unset(text, table, key, literal, info):
+    """Take out what toml_set put in, and nothing else. A line the user has
+    changed since is left alone."""
+    lines = (text or "").split("\n")
+    b = toml_table_bounds(lines, table)
+    if b is None:
+        return text
+    h, end = b
+    j = toml_key_line(lines, h + 1, end, key)
+    if j is None or lines[j].split("#", 1)[0].strip().replace(" ", "") != f"{key}={literal}":
+        return text
+    if info.get("oldLine") is not None:
+        lines[j] = info["oldLine"]
+        return "\n".join(lines)
+    del lines[j]
+    end -= 1
+    if info.get("createdTable") and all(not l.strip() for l in lines[h + 1:end]):
+        # The header and the blank lines after it go. The blank line that
+        # toml_set put before the header is then the file's last line break.
+        del lines[h:end]
+    return "\n".join(lines)
+
+
+class DevTool:
+    """One developer tool the telemetry row covers. present() says whether
+    it is installed, off() whether its telemetry is off, and set_off() and
+    undo() change it. undo() is given what set_off() recorded."""
+    name = ""
+    label = ""
+
+    def present(self, ctx):
+        raise NotImplementedError
+
+    def off(self, ctx):
+        raise NotImplementedError
+
+    def set_off(self, ctx):
+        raise NotImplementedError
+
+    def undo(self, ctx, info):
+        raise NotImplementedError
+
+
+class GhTool(DevTool):
+    name = "gh"
+    label = "GitHub CLI"
+
+    def config_path(self, ctx):
+        d = ctx.environ.get("GH_CONFIG_DIR") or str(ctx.config_home / "gh")
+        return Path(d) / "config.yml"
+
+    def present(self, ctx):
+        return bool(ctx.which("gh"))
+
+    def off(self, ctx):
+        # Read from the file, so a status run starts no process. gh writes
+        # the key at the top level as `telemetry: disabled`.
+        for line in (read_text(self.config_path(ctx)) or "").splitlines():
+            m = re.match(r"^telemetry:\s*(\S*)\s*$", line)
+            if m:
+                return m.group(1).strip("\"'") == "disabled"
+        return False
+
+    def gh(self, ctx, value):
+        rc, _, err = ctx.run(["gh", "config", "set", "telemetry", value], timeout=15)
+        if rc != 0:
+            raise ActionError(f"gh config set telemetry {value} failed: {(err or '').strip()[:120]}")
+
+    def set_off(self, ctx):
+        self.gh(ctx, "disabled")
+        return {}
+
+    def undo(self, ctx, info):
+        if self.off(ctx):
+            self.gh(ctx, "enabled")
+
+
+class TomlTool(DevTool):
+    """A tool configured by keys in a TOML file of its own."""
+    keys = ()      # (table, key, literal)
+
+    def path(self, ctx):
+        raise NotImplementedError
+
+    def present(self, ctx):
+        return self.path(ctx).parent.is_dir() or bool(ctx.which(self.name))
+
+    def off(self, ctx):
+        text = read_text(self.path(ctx))
+        if text is None:
+            return False
+        return all(same_json(toml_value(text, t, k), toml_literal(lit)) for t, k, lit in self.keys)
+
+    def set_off(self, ctx):
+        path = self.path(ctx)
+        text = read_text(path)
+        created = text is None
+        text = text or ""
+        info = {"keys": []}
+        for table, key, lit in self.keys:
+            if same_json(toml_value(text, table, key), toml_literal(lit)):
+                info["keys"].append(None)
+                continue
+            text, one = toml_set(text, table, key, lit)
+            info["keys"].append(one)
+        if created:
+            info["createdFile"] = True
+        atomic_write(path, text, mode=0o600)
+        return info
+
+    def undo(self, ctx, info):
+        path = self.path(ctx)
+        text = read_text(path)
+        if text is None:
+            return
+        before = text
+        keys = info.get("keys") or [{}] * len(self.keys)
+        for (table, key, lit), one in zip(self.keys, keys):
+            if one is None:
+                continue
+            text = toml_unset(text, table, key, lit, one)
+        if info.get("createdFile") and not text.strip():
+            os.unlink(os.path.realpath(path))
+            return
+        if text != before:
+            atomic_write(path, text)
+
+
+class CodexTool(TomlTool):
+    name = "codex"
+    label = "Codex"
+    # AnalyticsConfigToml in the codex binary has the one field, enabled.
+    keys = (("analytics", "enabled", "false"),)
+
+    def path(self, ctx):
+        return ctx.codex_config
+
+
+class GrokTool(TomlTool):
+    name = "grok"
+    label = "Grok CLI"
+    # From ~/.grok/docs/user-guide/05-configuration.md: the product analytics
+    # switch, and session trace uploads, which follow it only when unset.
+    keys = (("features", "telemetry", "false"), ("telemetry", "trace_upload", "false"))
+
+    def path(self, ctx):
+        return ctx.grok_config
+
+
+class MiseTool(DevTool):
+    name = "mise"
+    label = "mise"
+
+    def mise(self, ctx, *args):
+        cwd = str(ctx.home) if ctx.home.is_dir() else None
+        return ctx.run(["mise", "settings", *args], timeout=15, cwd=cwd)
+
+    def present(self, ctx):
+        return bool(ctx.which("mise"))
+
+    def off(self, ctx):
+        rc, out, _ = self.mise(ctx, "get", "use_versions_host")
+        return rc == 0 and out.strip() == "false"
+
+    def set_off(self, ctx):
+        rc, _, err = self.mise(ctx, "set", "use_versions_host", "false")
+        if rc != 0:
+            raise ActionError(f"mise settings set failed: {(err or '').strip()[:120]}")
+        return {}
+
+    def undo(self, ctx, info):
+        if self.off(ctx):
+            self.mise(ctx, "unset", "use_versions_host")
+
+
+def npmrc_line(lines, key):
+    """The index of the last `key=value` line in an .npmrc, which is the one
+    npm reads, or None."""
+    pat = re.compile(r"^\s*" + re.escape(key) + r"\s*=")
+    found = None
+    for i, line in enumerate(lines):
+        if pat.match(line):
+            found = i
+    return found
+
+
+def npmrc_value(line):
+    return line.split("=", 1)[1].strip().strip("\"'")
+
+
+class NpmTool(DevTool):
+    name = "npm"
+    label = "npm"
+    # The update notifier asks registry.npmjs.org for npm's latest version on
+    # each run, and fund prints the funding links, both on by default. audit
+    # is left alone: it is useful.
+    keys = (("update-notifier", "false"), ("fund", "false"))
+
+    def present(self, ctx):
+        return bool(ctx.which("npm"))
+
+    def off(self, ctx):
+        lines = (read_text(ctx.npmrc) or "").split("\n")
+        for key, value in self.keys:
+            j = npmrc_line(lines, key)
+            if j is None or npmrc_value(lines[j]) != value:
+                return False
+        return True
+
+    def set_off(self, ctx):
+        text = read_text(ctx.npmrc)
+        info = {"keys": []}
+        if text is None:
+            info["createdFile"] = True
+        lines = (text or "").split("\n")
+        for key, value in self.keys:
+            j = npmrc_line(lines, key)
+            if j is not None and npmrc_value(lines[j]) == value:
+                info["keys"].append(None)
+                continue
+            if j is not None:
+                info["keys"].append({"oldLine": lines[j]})
+                lines[j] = f"{key}={value}"
+            else:
+                info["keys"].append({})
+                # Before the final line break, so the file keeps its ending.
+                lines.insert(len(lines) - 1 if lines[-1] == "" else len(lines), f"{key}={value}")
+        atomic_write(ctx.npmrc, "\n".join(lines), mode=0o600)
+        return info
+
+    def undo(self, ctx, info):
+        text = read_text(ctx.npmrc)
+        if text is None:
+            return
+        lines = text.split("\n")
+        keys = info.get("keys") or [{}] * len(self.keys)
+        for (key, value), one in zip(self.keys, keys):
+            if one is None:
+                continue
+            j = npmrc_line(lines, key)
+            # A line the user has changed since is left alone.
+            if j is None or lines[j].strip().replace(" ", "") != f"{key}={value}":
+                continue
+            if one.get("oldLine") is not None:
+                lines[j] = one["oldLine"]
+            else:
+                del lines[j]
+        new = "\n".join(lines)
+        if info.get("createdFile") and not new.strip():
+            os.unlink(os.path.realpath(ctx.npmrc))
+            return
+        if new != text:
+            atomic_write(ctx.npmrc, new)
+
+
+DEV_TOOLS = (GhTool(), CodexTool(), GrokTool(), MiseTool(), NpmTool())
+
+
+class DevTelemetryRow(Row):
+    id = "dev-telemetry"
+    label = "Developer tool telemetry"
+    about = ("npm no longer says when a newer npm is out, and mise lists versions from "
+             "each tool's own source, such as GitHub, which can be slower. "
+             "Turns off usage reports in the developer tools Omarchy installs: gh's "
+             "telemetry, Codex analytics, the Grok CLI's telemetry and trace uploads, "
+             "mise's version lookups at mise-versions.jdx.dev, and npm's update notifier "
+             "and funding messages in ~/.npmrc. Only these keys are changed; everything "
+             "else in each tool's settings, npm's audit included, is left as it is.")
+
+    def tools(self, ctx):
+        return [t for t in DEV_TOOLS if t.present(ctx)]
+
+    def check(self, ctx, rec=None):
+        tools = self.tools(ctx)
+        if not tools:
+            return result("na", "none installed", "None of gh, Codex, Grok CLI, mise or npm is installed.")
+        on, bad = [], []
+        for t in tools:
+            try:
+                (on if t.off(ctx) else bad).append(t)
+            except ActionError as exc:
+                return result("unknown", "unreadable", self.about,
+                              attention=f"{t.label}: {exc}")
+        if not bad:
+            return result("in", f"{len(on)} of {len(tools)} off", self.about)
+        names = ", ".join(t.label for t in bad)
+        return result("partial" if on else "out", f"{len(on)} of {len(tools)} off", self.about,
+                      why=f"{names} still " + ("sends" if len(bad) == 1 else "send")
+                          + " usage reports.")
+
+    def apply(self, ctx, chk, rec):
+        done = rec.setdefault("tools", {})
+        for t in self.tools(ctx):
+            if t.off(ctx):
+                done.setdefault(t.name, {"adopted": True})
+                continue
+            done[t.name] = t.set_off(ctx)
+
+    def revert(self, ctx, rec):
+        done = rec.get("tools")
+        if done is None:
+            # Adopted as a whole: every tool was off already.
+            done = {t.name: {"adopted": True} for t in self.tools(ctx)}
+        by_name = {t.name: t for t in DEV_TOOLS}
+        for name, info in list(done.items()):
+            t = by_name.get(name)
+            if t is not None and t.present(ctx):
+                t.undo(ctx, info)
+
+
+# ------------------------------------------------ Neovim's update checker
+
+NVIM_CHECKER = re.compile(r"\bchecker\s*=\s*\{([^{}]*)\}")
+NVIM_ENABLED = re.compile(r"\benabled\s*=\s*([A-Za-z_][\w.]*)")
+
+
+def nvim_checker(text):
+    """(enabled, start, end) for the value in lazy.lua's `checker = { enabled
+    = ... }` table, where start and end are the value's place in the text, or
+    None when the file does not have that one table with a plain true or
+    false in it, since editing it then would be a guess."""
+    blocks = list(NVIM_CHECKER.finditer(text or ""))
+    if len(blocks) != 1:
+        return None
+    hits = []
+    pos = blocks[0].start(1)
+    for line in blocks[0].group(1).split("\n"):
+        code = line.split("--", 1)[0]
+        hits.extend((pos + m.start(1), pos + m.end(1), m.group(1))
+                    for m in NVIM_ENABLED.finditer(code))
+        pos += len(line) + 1
+    if len(hits) != 1 or hits[0][2] not in ("true", "false"):
+        return None
+    start, end, value = hits[0]
+    return value == "true", start, end
+
+
+class NvimCheckerRow(Row):
+    id = "nvim-checker"
+    label = "Neovim plugin update check"
+    about = ("Neovim's status line no longer shows that plugin updates are waiting; "
+             ":Lazy update still checks and updates when you ask. Sets enabled = false "
+             "in the checker table of ~/.config/nvim/lua/config/lazy.lua, so lazy.nvim "
+             "stops fetching every installed plugin from GitHub about once an hour while "
+             "Neovim is open. Nothing else in the file is changed. It applies the next "
+             "time Neovim starts.")
+
+    def check(self, ctx, rec=None):
+        text = read_text(ctx.nvim_lazy)
+        if text is None:
+            return result("na", "not set up", "Neovim has no lazy.nvim settings for this account.")
+        found = nvim_checker(text)
+        if found is None:
+            why = ("lazy.lua does not have the stock checker = { enabled = ... } table, so "
+                   "it has been left alone. Set the checker's enabled to false by hand.")
+            return result("unknown", "not the stock layout", self.about, attention=why)
+        if not found[0]:
+            return result("in", "off", self.about)
+        return result("out", "checking for updates", self.about,
+                      why="lazy.nvim fetches every plugin from GitHub about once an hour "
+                          "while Neovim is open.")
+
+    def apply(self, ctx, chk, rec):
+        text = read_text(ctx.nvim_lazy)
+        found = nvim_checker(text)
+        if found is None:
+            raise ActionError("lazy.lua does not have the stock checker table, so it has "
+                              "been left alone")
+        enabled, start, end = found
+        if not enabled:
+            return
+        atomic_write(ctx.nvim_lazy, text[:start] + "false" + text[end:])
+        rec["changed"] = True
+
+    def revert(self, ctx, rec):
+        if not rec.get("changed"):
+            return
+        text = read_text(ctx.nvim_lazy)
+        found = nvim_checker(text)
+        if found is None or found[0]:
+            return
+        _, start, end = found
+        atomic_write(ctx.nvim_lazy, text[:start] + "true" + text[end:])
+
+
+# ------------------------------------------------------ opt-out variables
+
+OPT_OUT_TEXT = """\
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# uwsm reads this at login, so every program in the session gets these. They
+# are the documented opt-outs for telemetry and update checks in developer
+# tools; a tool that is not installed ignores its own.
+""" + "".join(f"export {k}={v}\n" for k, v in OPT_OUT_VARS)
+
+
+class OptOutRow(Row):
+    id = "opt-out-env"
+    label = "Opt-out variables"
+    about = ("Deno and HashiCorp tools such as Terraform no longer say when a newer "
+             "version is out. Sets DO_NOT_TRACK=1 and the standard opt-out variables for "
+             "Deno, Next.js, .NET, HashiCorp tools, Astro, Gatsby, Turborepo, Storybook, "
+             "the Azure CLI, PowerShell, the AWS SAM CLI, vcpkg and Hint, in "
+             "~/.config/uwsm/env.d/90-black-ops-opt-out. Claude Code reads DO_NOT_TRACK "
+             "as it reads DISABLE_TELEMETRY, and nothing more. Programs started from the "
+             "desktop get them at once, and they apply fully from the next login.")
+
+    def missing(self, ctx):
+        """The variables the running session does not have with our value,
+        read with one call to systemctl."""
+        rc, out, _ = ctx.run(["systemctl", "--user", "show-environment"], timeout=5)
+        have = set(out.splitlines()) if rc == 0 else set()
+        return [k for k, v in OPT_OUT_VARS if f"{k}={v}" not in have]
+
+    def check(self, ctx, rec=None):
+        ours = read_text(ctx.opt_out_dropin) == OPT_OUT_TEXT
+        if not ours and not ctx.which("uwsm"):
+            return result("na", "no uwsm", "uwsm, which reads the variables at login, "
+                                           "is not installed.")
+        in_session = not self.missing(ctx)
+        if ours:
+            return result("in", "set" if in_session else "set from next login", self.about)
+        if in_session:
+            return result("in", "set by hand", self.about)
+        return result("out", "not set", self.about,
+                      why="Developer tools that honour DO_NOT_TRACK and the like are not "
+                          "asked to stay quiet.")
+
+    def apply(self, ctx, chk, rec):
+        if read_text(ctx.opt_out_dropin) != OPT_OUT_TEXT:
+            atomic_write(ctx.opt_out_dropin, OPT_OUT_TEXT)
+        # Programs started from the desktop from now on get them too. Only
+        # the ones not in the session already are set, and noted, so that
+        # switching off takes out only those.
+        new = self.missing(ctx)
+        if new:
+            rc, _, _ = ctx.run(["systemctl", "--user", "set-environment",
+                                *(f"{k}={v}" for k, v in OPT_OUT_VARS if k in new)], timeout=10)
+            if rc == 0:
+                rec["session"] = sorted(set(rec.get("session") or []) | set(new))
+
+    def revert(self, ctx, rec):
+        if read_text(ctx.opt_out_dropin) == OPT_OUT_TEXT:
+            ctx.opt_out_dropin.unlink()
+            for d in (ctx.uwsm_env_dir, ctx.uwsm_env_dir.parent):
+                with contextlib.suppress(OSError):
+                    d.rmdir()
+        names = [k for k, _ in OPT_OUT_VARS if k in (rec.get("session") or [])]
+        if names:
+            ctx.run(["systemctl", "--user", "unset-environment", *names], timeout=10)
+
+
+# ------------------------------------------------------ optional, user level
+
+def session_env(ctx, name):
+    """A variable's value in the systemd user manager's environment, which
+    is what programs started from the desktop inherit, or None."""
+    rc, out, _ = ctx.run(["systemctl", "--user", "show-environment"], timeout=5)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        if line.startswith(name + "="):
+            v = line[len(name) + 1:]
+            if v.startswith("$'") and v.endswith("'"):
+                v = v[2:-1]
+            return v.strip()
+    return ""
+
+
+def debuginfod_urls(ctx):
+    """The servers Arch's /etc/profile.d/debuginfod.sh sets, joined as it does."""
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(ctx.etc / "debuginfod") if n.endswith(".urls"))
+    except OSError:
+        return ""
+    for n in names:
+        out.extend((read_text(ctx.etc / "debuginfod" / n) or "").split())
+    return " ".join(out)
+
+
+DEBUGINFOD_TEXT = """\
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# uwsm reads this after the login shell, so it wins over the value
+# /etc/profile.d/debuginfod.sh sets. An empty DEBUGINFOD_URLS keeps gdb and
+# other debuggers from asking debuginfod.archlinux.org for debug symbols.
+export DEBUGINFOD_URLS=
+"""
+
+
+class DebuginfodRow(Row):
+    id = "debuginfod"
+    label = "Debug symbol downloads"
+    optional = True
+    about = ("Stops gdb, coredumpctl and other debuggers downloading debug symbols from "
+             "debuginfod.archlinux.org, which tells that server which builds of which "
+             "programs you are debugging. It is set for the whole session through uwsm, "
+             "so it applies fully from the next login. Omarchy's crash diagnosis sets its "
+             "own server on its command line when you ask it for one, so that still works.")
+
+    def check(self, ctx, rec=None):
+        ours = read_text(ctx.debuginfod_dropin) == DEBUGINFOD_TEXT
+        now = session_env(ctx, "DEBUGINFOD_URLS")
+        if not ours and not debuginfod_urls(ctx) and not now:
+            return result("na", "no server set", "No debuginfod server is configured.")
+        if ours and now:
+            return result("in", "off from next login", self.about, attention=(
+                "The session still has a debuginfod server set. It goes at the next "
+                "login. If it stays after that, something else sets DEBUGINFOD_URLS."))
+        if ours:
+            return result("in", "off", self.about)
+        if now == "" and now is not None:
+            return result("in", "off by hand", self.about)
+        return result("out", "downloading symbols", self.about,
+                      why="Debuggers ask debuginfod.archlinux.org for the symbols of what "
+                          "they are debugging.")
+
+    def apply(self, ctx, chk, rec):
+        if not ctx.debuginfod_dropin.exists() or read_text(ctx.debuginfod_dropin) != DEBUGINFOD_TEXT:
+            atomic_write(ctx.debuginfod_dropin, DEBUGINFOD_TEXT)
+        # Programs started from the desktop from now on get the empty value.
+        ctx.run(["systemctl", "--user", "unset-environment", "DEBUGINFOD_URLS"], timeout=10)
+
+    def revert(self, ctx, rec):
+        if read_text(ctx.debuginfod_dropin) == DEBUGINFOD_TEXT:
+            ctx.debuginfod_dropin.unlink()
+            for d in (ctx.uwsm_env_dir, ctx.uwsm_env_dir.parent):
+                with contextlib.suppress(OSError):
+                    d.rmdir()
+        urls = debuginfod_urls(ctx)
+        if urls:
+            ctx.run(["systemctl", "--user", "set-environment", f"DEBUGINFOD_URLS={urls}"],
+                    timeout=10)
+
+
+class CrashWatchRow(Row):
+    id = "crash-watch"
+    label = "Crash diagnosis offer"
+    optional = True
+    about = ("Stops Omarchy's crash watcher, which puts up a notification for every "
+             "crash that sends the program's details to an AI assistant when clicked. "
+             "Crashes are still recorded, and coredumpctl still works.")
+
+    def check(self, ctx, rec=None):
+        unit = ctx.usr_lib / "systemd/user" / CRASH_UNIT
+        masked = ctx.crash_mask.is_symlink() and os.readlink(ctx.crash_mask) == "/dev/null"
+        if not unit.exists() and not masked:
+            return result("na", "not installed", "Omarchy's crash watcher is not installed.")
+        if masked:
+            return result("in", "stopped", self.about)
+        if ctx.crash_toggle.exists():
+            return result("in", "off by Omarchy's toggle", self.about)
+        return result("out", "offering AI diagnosis", self.about,
+                      why="Every crash puts up a notification that sends its details to an "
+                          "AI assistant when clicked.")
+
+    def apply(self, ctx, chk, rec):
+        rc, _, err = ctx.run(["systemctl", "--user", "mask", "--now", CRASH_UNIT], timeout=20)
+        if rc != 0:
+            raise ActionError(f"systemctl could not stop the crash watcher: {(err or '').strip()[:120]}")
+
+    def revert(self, ctx, rec):
+        if not ctx.crash_mask.is_symlink():
+            return
+        rc, _, err = ctx.run(["systemctl", "--user", "unmask", CRASH_UNIT], timeout=20)
+        if rc != 0:
+            raise ActionError(f"systemctl could not unmask the crash watcher: {(err or '').strip()[:120]}")
+        if not ctx.crash_toggle.exists():
+            ctx.run(["systemctl", "--user", "start", CRASH_UNIT], timeout=20)
+
+
+def fwupd_sharing(ctx):
+    """True when fwupd is set to share files with other machines, False when
+    it is not, None when that cannot be told without starting fwupd. The
+    policy is in /etc/fwupd/fwupd.conf, which only root can read, so it is
+    read back from the flags fwupd puts on its remotes, and only while it is
+    already running."""
+    rc, _, _ = ctx.run(["systemctl", "is-active", "--quiet", "fwupd.service"], timeout=5)
+    if rc != 0:
+        return None
+    rc, out, _ = ctx.run(["fwupdmgr", "get-remotes", "--json"], timeout=15)
+    if rc != 0:
+        return None
+    try:
+        remotes = json.loads(out).get("Remotes") or []
+    except (ValueError, AttributeError):
+        return None
+    return any(isinstance(r, dict) and int(r.get("Flags") or 0) & 1
+               and int(r.get("Flags") or 0) & FWUPD_P2P_FLAGS for r in remotes)
+
+
+class FwupdRow(Row):
+    id = "fwupd-p2p"
+    label = "Firmware peer sharing"
+    privileged = True
+    optional = True
+    about = ("Sets P2pPolicy=nothing in /etc/fwupd/fwupd.conf, so fwupd stops offering "
+             "its firmware metadata to other machines on the local network through "
+             "Passim, which also announces this machine over mDNS. Firmware updates "
+             "still download as before.")
+
+    def check(self, ctx, rec=None):
+        if not ctx.which("fwupdmgr"):
+            return result("na", "not installed", "fwupd is not installed.")
+        sharing = fwupd_sharing(ctx)
+        if sharing is False:
+            return result("in", "not sharing" if rec else "not sharing, by hand", self.about)
+        if sharing is None:
+            if rec is not None:
+                return result("in", "not sharing", self.about +
+                              " fwupd is not running, so this is read again when it next runs.")
+            return result("out", "not known while fwupd is stopped", self.about,
+                          why="fwupd shares metadata by default, and it is not running now "
+                              "to say otherwise.")
+        return result("out", "sharing metadata", self.about,
+                      why="fwupd offers its firmware metadata to other machines on the "
+                          "local network.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("fwupd-p2p-on")
+
+    def revert(self, ctx, rec):
+        ctx.helper("fwupd-p2p-off")
+
+
+class AvahiDaemonRow(Row):
+    id = "avahi-daemon"
+    label = "Avahi daemon"
+    privileged = True
+    optional = True
+    about = ("Finding printers and other machines on the local network by name stops "
+             "working. Stops and masks avahi-daemon, so the machine stops listening for and "
+             "sending mDNS on the local network.")
+
+    def check(self, ctx, rec=None):
+        masked = avahi_masked(ctx)
+        installed = (ctx.usr_lib / "systemd/system/avahi-daemon.service").exists()
+        if not installed and not masked:
+            return result("na", "not installed", "Avahi is not installed.")
+        if len(masked) == len(AVAHI_UNITS):
+            rc, _, _ = ctx.run(["systemctl", "is-active", "--quiet", "avahi-daemon.service"],
+                               timeout=5)
+            if rc == 0:
+                return result("partial", "masked, still running", self.about,
+                              why="The daemon is masked but was not stopped, so it still "
+                                  "listens until it is.")
+            return result("in", "stopped" if rec else "stopped, by hand", self.about)
+        if masked:
+            return result("partial", f"{masked[0]} masked", self.about,
+                          why="Only one of the daemon's two units is masked, so it can "
+                              "still be started.")
+        return result("out", "listening", self.about,
+                      why="avahi-daemon listens on port 5353 and sends mDNS queries on "
+                          "every network this machine joins.")
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("avahi-mask")
+
+    def revert(self, ctx, rec):
+        if avahi_masked(ctx):
+            ctx.helper("avahi-unmask")
+
+
+class ClaudeUsageRow(AgentsRow):
+    """Shares the Agents row's way of changing the providers. While this row
+    is on it owns Claude's value there; see claude_owned()."""
+    id = "claude-usage"
+    label = "Claude usage check"
+    optional = True
+    about = ("The Agents panel no longer shows Claude usage; Claude Code itself works "
+             "exactly as before. Every 15 minutes the panel sends your Claude Code sign-in "
+             "token to api.anthropic.com to read your usage, and again when the panel "
+             "opens. Switching this on stops that by turning Claude off in the Agents "
+             "widget's settings in ~/.config/omarchy/shell.json; nothing in ~/.claude is "
+             "read or changed. With Codex and Fireworks off as well, the widget stays on "
+             "the bar, asks no service at all and says it has no subscriptions to show.")
+
+    def check(self, ctx, rec=None):
+        try:
+            _, data = load_json(ctx.shell_json)
+        except ActionError as exc:
+            return result("unknown", "unreadable", str(exc), attention=str(exc))
+        entry = agents_entry(data)
+        if entry is None:
+            return result("na", "not on the bar", "The Agents widget is not on the bar.")
+        if not provider_enabled(entry.get("providers") or {}, "claude"):
+            return result("in", "off", self.about)
+        try:
+            minutes = max(30, int(entry.get("refreshIntervalSec", 900))) // 60
+        except (TypeError, ValueError):
+            minutes = 15
+        return result("out", "checking usage", self.about,
+                      why=f"The panel sends your Claude Code sign-in token to "
+                          f"api.anthropic.com every {minutes} minutes or so.")
+
+    def apply(self, ctx, chk, rec):
+        self.set(ctx, {"claude": False})
+        rec["changed"] = True
+
+    def revert(self, ctx, rec):
+        if rec.get("changed") and self.check(ctx)["state"] == "in":
+            self.set(ctx, {"claude": True})
+
+
+# The protections, in the order the panel shows them. Adding one is a Row
+# subclass above and an entry here; see Row.
+ROWS = [WeatherRow(), AgentsRow(), DnsRow(), ClaudeRow(), HostsRow(),
+        BluetoothRow(), IdentityRow(), ChromiumRow(), ConnectivityRow(), AvahiRow(),
+        WebappsRow(), DevTelemetryRow(), NvimCheckerRow(), OptOutRow(),
+        # Optional: off until switched on one by one.
+        UpdateBadgeRow(), HerdrRow(), LocalSendRow(), DebuginfodRow(), CrashWatchRow(),
+        FwupdRow(), AvahiDaemonRow(), BtPrivacyRow(), ClaudeUsageRow()]
+
+
+# ------------------------------------------------------- phase 2 extensions
+
+# Software watch and listen mode live in modules of their own under lib/, so
+# that each can be built without touching this file. docs/contract.md fixes
+# what each module provides. A module that is missing, or that fails to
+# load, leaves Black Ops working without it and says so in the report.
+LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+EXTENSIONS = {"watch": "black_ops_watch", "listen": "black_ops_listen"}
+
+
+def load_extension(name):
+    """(module or None, error message or "")."""
+    import importlib.util
+    path = LIB_DIR / f"{EXTENSIONS[name]}.py"
+    if not path.is_file():
+        return None, ""
+    try:
+        spec = importlib.util.spec_from_file_location(EXTENSIONS[name], path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module, ""
+    except Exception as exc:          # a broken extension must not stop the rest
+        return None, f"{name} could not be loaded: {type(exc).__name__}"
+
+
+EXT = {}
+EXT_ERRORS = {}
+for _name in EXTENSIONS:
+    EXT[_name], EXT_ERRORS[_name] = load_extension(_name)
+
+
+def ext_call(name, func, *args, default=None):
+    """Call a function an extension provides, or return `default` when the
+    extension or the function is not there or it raised."""
+    module = EXT.get(name)
+    fn = getattr(module, func, None) if module is not None else None
+    if fn is None:
+        return default
+    try:
+        return fn(*args)
+    except Exception as exc:
+        EXT_ERRORS[name] = f"{name}.{func} failed: {type(exc).__name__}: {str(exc)[:160]}"
+        return default
+
+
+class _Api:
+    """What an extension is given to build on: every name in this module,
+    looked up when it is used, so functions defined further down work too."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+API = _Api()
+
+# The hook for rows: each extension's make_row(api) returns a Row, built on
+# this module's Row and result(), or None while it has none to offer. Watch
+# and listen are optional rows, so they come after the others.
+for _name in EXTENSIONS:
+    _row = ext_call(_name, "make_row", API)
+    if isinstance(_row, Row) and _row.id == _name:
+        ROWS.append(_row)
+
+BY_ID = {r.id: r for r in ROWS}
+
+# Rows earlier versions had, which now belong to the apps they concern. A
+# record of one in the state file is forgotten, and the protection it stands
+# for is left exactly as it is: removing a row from Black Ops hands the
+# protection over, it does not undo it. Kept for the record; any row id that
+# is not in ROWS is forgotten the same way.
+FORMER_ROWS = {
+    "onnx": "0.2.0",            # onnxruntime telemetry folder, now Nightloom's
+    "ollama-offline": "0.2.0",  # Ollama cloud features, now Nightloom's
+    "ollama-block": "0.2.0",    # the optional ollama.com block, now Nightloom's
+    "openwebui": "0.2.0",       # Open WebUI code execution, an optional app
+    "proton": "0.2.0",          # a VPN app's crash reports, an optional app
+}
+
+
+# ------------------------------------------------------------------- rows.d
+
+# Other stacks, such as Nightloom, register rows of their own as JSON files
+# in ~/.config/omarchy-black-ops/rows.d. Those rows only report whether
+# something is in place. They cannot switch anything, and their checks are
+# declarative, so a file there can never make Black Ops run a program or
+# send anything. docs/contract.md describes the format.
+ROWS_D_SCHEMA = 1
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+CHECK_KINDS = ("hosts", "file", "json", "toml", "env", "unit", "all")
+UNIT_STATES = ("masked", "disabled", "enabled", "active", "inactive")
+
+
+class RowsDError(Exception):
+    pass
+
+
+def rows_d_path(ctx, raw):
+    """A path from a rows.d file: absolute, or under the home folder with a
+    leading ~/, and with no .. in it."""
+    if not isinstance(raw, str) or not raw or "\0" in raw:
+        raise RowsDError("a path is not a string")
+    if raw.startswith("~/"):
+        p = ctx.home / raw[2:]
+    elif raw.startswith("/"):
+        p = Path(raw)
+    else:
+        raise RowsDError(f"a path must start with / or ~/: {raw[:60]}")
+    if ".." in p.parts:
+        raise RowsDError("a path may not contain ..")
+    return p
+
+
+def dotted(data, key):
+    for part in key.split("."):
+        if not isinstance(data, dict) or part not in data:
+            return None
+        data = data[part]
+    return data
+
+
+def validate_check(ctx, c, depth=0):
+    """Raise RowsDError unless `c` is a check this version understands."""
+    if not isinstance(c, dict) or depth > 3:
+        raise RowsDError("a check is not an object")
+    kinds = [k for k in CHECK_KINDS if k in c]
+    if len(kinds) != 1:
+        raise RowsDError("a check must have exactly one of: " + ", ".join(CHECK_KINDS))
+    kind = kinds[0]
+    if kind == "hosts":
+        if not (isinstance(c["hosts"], list) and c["hosts"] and
+                all(isinstance(h, str) and re.fullmatch(r"[A-Za-z0-9.-]{1,253}", h) for h in c["hosts"])):
+            raise RowsDError("hosts must be a list of host names")
+    elif kind == "file":
+        rows_d_path(ctx, c["file"])
+        if ("exists" in c) == ("contains" in c):
+            raise RowsDError("a file check needs exists or contains")
+        if "exists" in c and not isinstance(c["exists"], bool):
+            raise RowsDError("exists must be true or false")
+        if "contains" in c and not isinstance(c["contains"], str):
+            raise RowsDError("contains must be a string")
+    elif kind in ("json", "toml"):
+        rows_d_path(ctx, c[kind])
+        if not isinstance(c.get("key"), str) or "equals" not in c:
+            raise RowsDError(f"a {kind} check needs key and equals")
+    elif kind == "env":
+        if not isinstance(c["env"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", c["env"]) \
+                or not isinstance(c.get("equals"), str):
+            raise RowsDError("an env check needs a variable name and equals, a string")
+    elif kind == "unit":
+        if not isinstance(c["unit"], str) or not re.fullmatch(r"[A-Za-z0-9@._-]+\.(service|socket|timer|path)", c["unit"]) \
+                or c.get("state") not in UNIT_STATES or not isinstance(c.get("user", False), bool):
+            raise RowsDError("a unit check needs a unit name, a state and user true or false")
+    elif kind == "all":
+        if not isinstance(c["all"], list) or not c["all"]:
+            raise RowsDError("all must be a list of checks")
+        for sub in c["all"]:
+            validate_check(ctx, sub, depth + 1)
+
+
+def run_check(ctx, c):
+    """Whether a declarative check holds. Reads only; never reports what a
+    file holds."""
+    if "all" in c:
+        return all(run_check(ctx, sub) for sub in c["all"])
+    if "hosts" in c:
+        blocked = hosts_view(read_text(ctx.hosts) or "")["blocked"]
+        return all(h in blocked for h in c["hosts"])
+    if "file" in c:
+        p = rows_d_path(ctx, c["file"])
+        if "exists" in c:
+            return p.exists() == c["exists"]
+        return any(l.strip() == c["contains"].strip() for l in (read_text(p) or "").splitlines())
+    if "json" in c:
+        try:
+            _, data = load_json(rows_d_path(ctx, c["json"]))
+        except ActionError:
+            return False
+        return same_json(dotted(data, c["key"]), c["equals"])
+    if "toml" in c:
+        try:
+            data = tomllib.loads(read_text(rows_d_path(ctx, c["toml"])) or "")
+        except tomllib.TOMLDecodeError:
+            return False
+        return same_json(dotted(data, c["key"]), c["equals"])
+    if "env" in c:
+        v = session_env(ctx, c["env"])
+        return v is not None and v == c["equals"]
+    if "unit" in c:
+        scope = ["--user"] if c.get("user") else []
+        if c["state"] in ("active", "inactive"):
+            rc, out, _ = ctx.run(["systemctl", *scope, "is-active", c["unit"]], timeout=5)
+        else:
+            rc, out, _ = ctx.run(["systemctl", *scope, "is-enabled", c["unit"]], timeout=5)
+        state = out.strip().splitlines()[0] if out.strip() else ""
+        if c["state"] == "disabled":
+            return state in ("disabled", "masked", "static", "not-found", "")
+        return state == c["state"]
+    return False
+
+
+class RegisteredRow(Row):
+    """A row another stack registered in rows.d. It reports and never switches."""
+    registered = True
+
+    def __init__(self, stack, spec, ctx):
+        self.stack = stack
+        self.id = f"{stack}/{spec['id']}"
+        self.label = spec["label"]
+        self.about = spec.get("about", "")
+        self.spec = spec
+
+    def check(self, ctx, rec=None):
+        applies = self.spec.get("applies")
+        if applies is not None and not run_check(ctx, applies):
+            return result("na", "not installed", self.about)
+        if run_check(ctx, self.spec["check"]):
+            return result("in", self.spec.get("valueIn", "in place"), self.about)
+        return result("out", self.spec.get("valueOut", "not in place"), self.about,
+                      why=self.spec.get("why", "") or f"{self.label} is not in place.")
+
+    def apply(self, ctx, chk, rec):
+        raise ActionError("Rows other stacks register only report; switch them in that stack.")
+
+    def revert(self, ctx, rec):
+        return
+
+
+def trusted_file(path):
+    """Owned by this account and writable by nobody else, as the file and
+    its folder must be before a rows.d file is read."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return info.st_uid == os.getuid() and not info.st_mode & 0o022 and not stat.S_ISLNK(info.st_mode)
+
+
+def load_rows_d(ctx):
+    """([RegisteredRow], [{"file": name, "why": reason}]). A file that is
+    not valid is skipped whole and named, and the rest still load."""
+    rows, skipped = [], []
+    try:
+        names = sorted(n for n in os.listdir(ctx.rows_d) if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        return rows, skipped
+    if not trusted_file(ctx.rows_d):
+        return rows, [{"file": "rows.d", "why": "the folder is writable by others or is a link"}]
+    seen = set()
+    for name in names:
+        path = ctx.rows_d / name
+        try:
+            if not trusted_file(path):
+                raise RowsDError("the file is writable by others or is a link")
+            try:
+                doc = json.loads(read_text(path) or "")
+            except ValueError:
+                raise RowsDError("not valid JSON")
+            if not isinstance(doc, dict) or doc.get("schema") != ROWS_D_SCHEMA:
+                raise RowsDError(f"schema must be {ROWS_D_SCHEMA}")
+            stack = doc.get("stack")
+            if not isinstance(stack, str) or not NAME_RE.match(stack) or stack != name[:-5]:
+                raise RowsDError("stack must be a short lower-case name matching the file name")
+            if stack in BY_ID or stack in EXTENSIONS:
+                raise RowsDError("stack clashes with a Black Ops row")
+            specs = doc.get("rows")
+            if not isinstance(specs, list) or not specs or len(specs) > 32:
+                raise RowsDError("rows must be a list of 1 to 32 rows")
+            built = []
+            for spec in specs:
+                if not isinstance(spec, dict) or not isinstance(spec.get("id"), str) \
+                        or not NAME_RE.match(spec["id"]):
+                    raise RowsDError("each row needs a short lower-case id")
+                if not isinstance(spec.get("label"), str) or not 0 < len(spec["label"]) <= 60:
+                    raise RowsDError("each row needs a label of up to 60 characters")
+                for k in ("about", "why", "valueIn", "valueOut"):
+                    if k in spec and (not isinstance(spec[k], str) or len(spec[k]) > 600):
+                        raise RowsDError(f"{k} must be a string of up to 600 characters")
+                validate_check(ctx, spec.get("check"))
+                if "applies" in spec:
+                    validate_check(ctx, spec["applies"])
+                row = RegisteredRow(stack, spec, ctx)
+                if row.id in seen:
+                    raise RowsDError(f"row {spec['id']} is listed twice")
+                seen.add(row.id)
+                built.append(row)
+            rows.extend(built)
+        except RowsDError as exc:
+            skipped.append({"file": name, "why": str(exc)})
+    return rows, skipped
+
+
+# ------------------------------------------------------------------ the state
+
+STATE_VERSION = 2
+
+
+def default_state():
+    return {"version": STATE_VERSION, "master": False, "rows": {}, "excluded": [],
+            "optIn": [], "notified": [], "errors": {}, "omarchy": {}}
+
+
+def notified_key_known(key):
+    """A notification is recorded as the row, or the flagged item, and the
+    colour it was sent for. Keys for rows that have gone are dropped."""
+    if not isinstance(key, str):
+        return False
+    # Before 0.3.0 a key was the row id alone.
+    what = key.rsplit(":", 1)[0]
+    return what in BY_ID or "/" in what
+
+
+def load_state(ctx):
+    """(state, stale). Rows this version does not have are forgotten, never
+    reverted. stale says the file on disk differs from what was loaded, so
+    that the next run saves it, even a plain status run."""
+    st = default_state()
+    text = read_text(ctx.state_dir / "state.json")
+    data = None
+    if text:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        for k in st:
+            if k != "version" and isinstance(data.get(k), type(st[k])):
+                st[k] = data[k]
+    st["rows"] = {k: v for k, v in st["rows"].items() if k in BY_ID}
+    st["errors"] = {k: v for k, v in st["errors"].items() if k in BY_ID}
+    st["excluded"] = [k for k in st["excluded"] if k in BY_ID]
+    st["optIn"] = [k for k in st["optIn"] if k in BY_ID and BY_ID[k].optional]
+    st["notified"] = [k for k in st["notified"] if notified_key_known(k)]
+    ctx.state = st
+    return st, isinstance(data, dict) and data != st
+
+
+def save_state(ctx, st):
+    ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(ctx.state_dir, 0o700)
+    atomic_write(ctx.state_dir / "state.json", json.dumps(st, indent=2) + "\n", mode=0o600)
+
+
+@contextlib.contextmanager
+def locked(ctx):
+    """One change at a time, so a click in the panel and a timer tick cannot
+    interleave their writes to the state file."""
+    ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(ctx.state_dir / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def intended(st, row):
+    if not st["master"]:
+        return False
+    if row.registered:
+        return True
+    if row.optional:
+        return row.id in st["optIn"]
+    return row.id not in st["excluded"]
+
+
+# -------------------------------------------------------- the Omarchy version
+
+def omarchy_version(ctx):
+    """The installed omarchy package's version, read from pacman's local
+    database the way `pacman -Q omarchy` reads it, or None."""
+    try:
+        names = [n for n in os.listdir(ctx.pacman_db) if n.startswith("omarchy-")]
+    except OSError:
+        return None
+    for n in names:
+        desc = read_text(ctx.pacman_db / n / "desc") or ""
+        m = re.search(r"^%NAME%\n(.*)\n", desc, re.M)
+        if m and m.group(1) == "omarchy":
+            v = re.search(r"^%VERSION%\n(.*)\n", desc, re.M)
+            return v.group(1) if v else None
+    return None
+
+
+def record_version(st, version):
+    st["omarchy"] = {"version": version, "at": int(time.time())}
+
+
+def version_due(ctx, st):
+    """(current version, the one recorded, whether they differ). An update
+    to Omarchy is when a stock default is most likely to come back, so the
+    first run after one is strict: see status()."""
+    cur = omarchy_version(ctx)
+    rec = st["omarchy"].get("version") if isinstance(st.get("omarchy"), dict) else None
+    return cur, rec, bool(st["master"] and cur and cur != rec)
+
+
+# ------------------------------------------------------------- the switching
+
+def engage(ctx, st, row):
+    """Put one row in place, adopting it if it already is."""
+    rec = st["rows"].get(row.id)
+    chk = row.check(ctx, rec)
+    if chk["state"] == "na":
+        st["errors"].pop(row.id, None)
+        return
+    if chk["state"] == "in" and not chk["work"]:
+        if rec is None:
+            st["rows"][row.id] = {"how": "adopted", "at": int(time.time())}
+        st["errors"].pop(row.id, None)
+        return
+    new = rec if rec is not None else {
+        "how": "adopted" if chk["state"] == "in" or chk["core"] else "applied",
+        "at": int(time.time())}
+    try:
+        row.apply(ctx, chk, new)
+    except (ActionError, OSError) as exc:
+        st["errors"][row.id] = message(exc)
+        # A partial change is still a change, so it is recorded and will be
+        # undone on the way off.
+        if rec is None and row.check(ctx, new)["state"] not in ("out", "na"):
+            st["rows"][row.id] = new
+        return
+    st["rows"][row.id] = new
+    st["errors"].pop(row.id, None)
+
+
+def disengage(ctx, st, row):
+    """Undo one row, if this plugin applied or adopted it."""
+    rec = st["rows"].get(row.id)
+    if rec is None:
+        st["errors"].pop(row.id, None)
+        return True
+    try:
+        row.revert(ctx, rec)
+    except (ActionError, OSError) as exc:
+        st["errors"][row.id] = message(exc)
+        return False
+    del st["rows"][row.id]
+    st["errors"].pop(row.id, None)
+    return True
+
+
+def message(exc):
+    if isinstance(exc, ActionError):
+        return str(exc)
+    return f"{exc.strerror or 'error'}" + (f": {Path(exc.filename).name}" if exc.filename else "")
+
+
+def switch_on(ctx, st):
+    st["master"] = True
+    for row in ROWS:
+        if intended(st, row):
+            engage(ctx, st, row)
+    # Switching on checks everything afresh, so it is the new baseline.
+    cur = omarchy_version(ctx)
+    if cur and st["omarchy"].get("version") != cur:
+        record_version(st, cur)
+
+
+def switch_off(ctx, st):
+    st["master"] = False
+    # Optional rows are switched off with everything else, and the main switch
+    # never switches them on again: each one waits for its own switch.
+    st["optIn"] = []
+    for row in ROWS:
+        disengage(ctx, st, row)
+    st["notified"] = []
+
+
+def switch_row(ctx, st, row_id, on):
+    row = BY_ID.get(row_id)
+    if row is None:
+        if "/" in (row_id or ""):
+            raise ActionError("Rows other stacks register only report; switch them in that stack.")
+        raise ActionError(f"no such row: {row_id}")
+    if on:
+        if not st["master"]:
+            raise ActionError("Switch Black Ops on first.")
+        if row.optional:
+            if row.id not in st["optIn"]:
+                st["optIn"].append(row.id)
+        elif row.id in st["excluded"]:
+            st["excluded"].remove(row.id)
+        engage(ctx, st, row)
+    else:
+        if row.optional:
+            if row.id in st["optIn"]:
+                st["optIn"].remove(row.id)
+        elif row.id not in st["excluded"]:
+            st["excluded"].append(row.id)
+        disengage(ctx, st, row)
+
+
+def open_pair_window(ctx, st):
+    row = BY_ID["bluetooth"]
+    if not intended(st, row):
+        raise ActionError("Bluetooth pairing is not switched on in Black Ops, so the adapter "
+                          "is pairable already.")
+    if row.check(ctx, st["rows"].get(row.id))["state"] == "na":
+        raise ActionError("There is no Bluetooth adapter to pair with.")
+    row.open_window(ctx)
+
+
+def heal(ctx, st):
+    """What the watchdog puts back by itself on each check."""
+    for row in ROWS:
+        if intended(st, row):
+            row.heal(ctx)
+
+
+# ------------------------------------------------------- flagged and reviewed
+
+VERDICTS = ("allowed", "false-positive")
+# What an extension's item must carry. The core sets `source` itself, from
+# the extension it came from.
+FLAG_FIELDS = ("id", "kind", "severity", "program", "signature", "summary")
+
+
+def load_reviews(ctx):
+    """{item id: review} from the review store. The software watch writes
+    it; this only reads it. A store that cannot be read counts as empty."""
+    try:
+        data = tomllib.loads(read_text(ctx.watch_dir / "reviewed.toml") or "")
+    except tomllib.TOMLDecodeError:
+        return {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, dict):
+        return {}
+    return {k: v for k, v in items.items()
+            if isinstance(v, dict) and v.get("verdict") in VERDICTS}
+
+
+def flagged_items(ctx, st):
+    """What the software watch and listen mode flag, with each item's
+    review. Only rows that are switched on flag anything."""
+    items = []
+    for name in EXTENSIONS:
+        if name not in BY_ID or not intended(st, BY_ID[name]):
+            continue
+        found = ext_call(name, "flagged", ctx, API, default=[]) or []
+        for item in found if isinstance(found, list) else []:
+            if not isinstance(item, dict) or not all(isinstance(item.get(k), str) for k in FLAG_FIELDS):
+                continue
+            if item["severity"] not in ("warn", "leak"):
+                continue
+            # Red is kept for what listen mode saw happen.
+            if item["severity"] == "leak" and not (name == "listen" and item["kind"] == "contact"
+                                                   and item.get("host")):
+                item["severity"] = "warn"
+            items.append(dict(item, source=name))
+    reviews = load_reviews(ctx)
+    for item in items:
+        review = reviews.get(item["id"])
+        item["reviewed"] = review is not None
+        item["verdict"] = review.get("verdict") if review else None
+        item["active"] = review is None
+        item["colour"] = ("red" if item["severity"] == "leak" else "amber") if item["active"] else "grey"
+    items.sort(key=lambda i: (not i["active"], i["severity"] != "leak", -int(i.get("lastSeen") or 0)))
+    return items
+
+
+def ext_report(ctx, st, name):
+    """An extension's own section of the report, or a placeholder."""
+    if EXT.get(name) is None:
+        return {"available": False, "error": EXT_ERRORS.get(name, "")}
+    rep = ext_call(name, "report", ctx, API, default=None)
+    if not isinstance(rep, dict):
+        return {"available": False, "error": EXT_ERRORS.get(name, "")}
+    return dict(rep, available=True)
+
+
+# ----------------------------------------------------------------- the report
+
+def colour_of(status_name):
+    """The colour a row's status is drawn in. The one place this is decided."""
+    return COLOURS.get(status_name, "grey")
+
+
+def row_status(chk, want, rec, one_way):
+    """ok, warn, leak, off or na, by the rule in the notes at the top."""
+    if chk["state"] == "na":
+        return "na"
+    if want:
+        if chk.get("leak"):
+            return "leak"
+        if chk["state"] == "in":
+            return "warn" if chk["attention"] else "ok"
+        return "warn"
+    if rec is not None and not one_way:
+        return "warn"          # switched off, but could not be removed
+    return "off"
+
+
+def names_of(labels):
+    text = ", ".join(labels[:2])
+    return text + (f" and {len(labels) - 2} more" if len(labels) > 2 else "")
+
+
+def status(ctx, st):
+    rows = []
+    failed, attention, pending, leaks, waiting = [], [], [], [], []
+    helper_state = ctx.helper_state()[0]
+    note = ctx.helper_note()
+    cur, recorded, changed = version_due(ctx, st)
+    strict = changed and bool(recorded)
+    registered, skipped = load_rows_d(ctx)
+    labels = {}
+    for row in ROWS + registered:
+        rec = st["rows"].get(row.id)
+        chk = row.check(ctx, rec)
+        want = intended(st, row)
+        err = st["errors"].get(row.id, "")
+        s = row_status(chk, want, rec, row.one_way)
+        labels[row.id] = row.label
+        missing = want and s == "warn" and chk["state"] in ("out", "partial") and not chk["attention"]
+        # A row that was never put in place, such as one new in this version
+        # or one whose change failed, has not slipped: it is still to apply.
+        slipped = missing and (rec is not None or row.registered) and not chk.get("new")
+        unapplied = missing and not slipped
+        if want and s == "leak":
+            leaks.append(row.id)
+        elif slipped:
+            failed.append(row.id)
+        elif unapplied:
+            waiting.append(row.id)
+        elif want and s == "warn":
+            attention.append(row.id)
+        if not want and rec is not None and not row.one_way:
+            pending.append(row.id)
+        detail = chk["detail"]
+        why = ""
+        if s == "leak":
+            why = chk["attention"] or chk["why"]
+        elif slipped:
+            why = chk["why"] or f"Switched on but not in place ({chk['value']})."
+            if row.registered:
+                why += f" Put it back in {row.stack}."
+            else:
+                why += " Switch on again to put it back."
+        elif unapplied:
+            why = (chk["why"] + " " if chk["why"] else "") + (
+                "Not put in place yet" + (f": {err}" if err else ". Switch on again to apply it."))
+        elif s == "warn" and want:
+            why = chk["attention"]
+        elif s == "warn":
+            why = "Switched off, but it could not be removed" + (f": {err}" if err else ".")
+        if strict and s in ("warn", "leak") and want:
+            why = f"Since Omarchy was updated to {cur}. " + why
+        if row.one_way and not want and chk["state"] == "in":
+            detail = ("Still rounded. Switching off does not restore the precision, "
+                      "because the precise figures were never kept.")
+        if row.privileged and note and (s == "warn" or chk["work"]):
+            err = err or note
+        rows.append({
+            "id": row.id, "label": row.label, "value": chk["value"], "detail": detail,
+            "why": why, "status": s, "colour": colour_of(s),
+            "inPlace": chk["state"] == "in", "intended": want,
+            "managed": rec.get("how") if rec else None,
+            "oneWay": row.one_way, "optional": row.optional,
+            "privileged": row.privileged, "error": err,
+            "registered": row.registered,
+            "source": row.stack if row.registered else "black-ops",
+            "switchable": chk["state"] != "na" and bool(st["master"]) and not row.registered,
+        })
+    held = sum(1 for r in rows if r["intended"] and r["status"] == "ok")
+    flagged = flagged_items(ctx, st) if st["master"] else []
+    flag_leaks = [i for i in flagged if i["active"] and i["severity"] == "leak"]
+    flag_warn = [i for i in flagged if i["active"] and i["severity"] == "warn"]
+
+    if st["master"]:
+        if leaks or flag_leaks:
+            overall = "leak"
+            progs = sorted({i["program"] for i in flag_leaks}) or [labels[i] for i in leaks]
+            headline = f"On, but {names_of(progs)} contacted a telemetry host"
+        elif failed:
+            overall = "warn"
+            headline = (f"On, but {names_of([labels[i] for i in failed])} "
+                        + ("has" if len(failed) == 1 else "have") + " slipped")
+        elif waiting:
+            overall = "warn"
+            headline = (f"On, but {names_of([labels[i] for i in waiting])} "
+                        + ("is" if len(waiting) == 1 else "are") + " not applied yet")
+        elif attention:
+            overall = "warn"
+            headline = (f"On, but {names_of([labels[i] for i in attention])} "
+                        + ("needs" if len(attention) == 1 else "need") + " attention")
+        elif flag_warn:
+            overall = "warn"
+            n = len(flag_warn)
+            headline = f"On, but {n} flagged item" + (" needs" if n == 1 else "s need") + " review"
+            if all(i.get("firstScan") for i in flag_warn):       # expected, not a fault
+                headline = f"On, the first scan found {n} item" + ("" if n == 1 else "s") + " to review"
+        elif helper_state == "outdated":
+            # Nothing has slipped and the old rules still hold, but nothing
+            # that needs root can be changed until the helper is reinstalled.
+            overall = "warn"
+            headline = "On, but the root helper needs reinstalling"
+        else:
+            overall = "ok"
+            headline = f"On, {held} protection" + ("s" if held != 1 else "") + " holding"
+        if strict and overall == "ok":
+            headline += f" after the Omarchy update to {cur}"
+        elif strict:
+            headline += f" since the Omarchy update to {cur}"
+        # The new version becomes the baseline once every row has passed a
+        # strict check against it, and only then.
+        if cur and cur != recorded and (not recorded or overall == "ok"):
+            record_version(st, cur)
+    else:
+        if pending:
+            overall = "warn"
+            headline = f"Off, but {len(pending)} could not be removed"
+        else:
+            overall = "off"
+            # Off means not managing. Protections put in place by hand are
+            # still counted, so the headline never claims a stock machine
+            # that is not one.
+            by_hand = sum(1 for r in rows if r["inPlace"] and not r["registered"])
+            if by_hand:
+                headline = (f"Off, not managing. {by_hand} protection"
+                            + ("s are" if by_hand != 1 else " is") + " in place by hand")
+            else:
+                headline = "Off. The machine is as it ships"
+    bt = next(r for r in rows if r["id"] == "bluetooth")
+    now = int(time.time())
+    return {
+        "generatedAt": now, "version": VERSION, "master": bool(st["master"]),
+        "overall": overall, "colour": OVERALL_COLOURS[overall], "headline": headline,
+        "slipped": failed, "unapplied": waiting, "attention": attention, "leaks": leaks,
+        "pending": pending, "helperInstalled": ctx.helper_installed(),
+        "helperState": helper_state, "helperNote": note, "rows": rows,
+        "canPair": bt["intended"] and bt["status"] != "na",
+        "pairSecondsLeft": max(0, pair_until(ctx) - now) if bt["status"] != "na" else 0,
+        "omarchy": {"version": cur, "recorded": recorded, "changed": changed},
+        "flagged": flagged,
+        "watch": ext_report(ctx, st, "watch"),
+        "listen": ext_report(ctx, st, "listen"),
+        "rowsD": {"skipped": skipped},
+    }
+
+
+def summary(rep):
+    """The counts other tools may read, such as Security Scan's Privacy
+    section. Counts and states only: no host, program, path or file name."""
+    rows = [r for r in rep["rows"] if not r["registered"]]
+    count = lambda pred: sum(1 for r in rows if pred(r))
+    flagged = rep["flagged"]
+    watch, listen = rep["watch"], rep["listen"]
+    return {
+        "schema": 1,
+        "generatedAt": rep["generatedAt"],
+        "version": rep["version"],
+        "master": rep["master"],
+        "overall": rep["overall"],
+        "colour": rep["colour"],
+        "helperState": rep["helperState"],
+        "omarchyChanged": bool(rep["omarchy"]["changed"]),
+        "protections": {
+            "holding": count(lambda r: r["intended"] and r["status"] == "ok"),
+            "slipped": len(rep["slipped"]),
+            "unapplied": len(rep["unapplied"]),
+            "attention": len(rep["attention"]),
+            "off": count(lambda r: r["status"] == "off"),
+            "notApplicable": count(lambda r: r["status"] == "na"),
+        },
+        "registered": {
+            "holding": sum(1 for r in rep["rows"] if r["registered"] and r["status"] == "ok"),
+            "notHolding": sum(1 for r in rep["rows"] if r["registered"] and r["status"] == "warn"),
+        },
+        "watch": {
+            "enabled": bool(watch.get("enabled")),
+            "flagged": sum(1 for i in flagged if i["source"] == "watch"),
+            "unreviewed": sum(1 for i in flagged if i["source"] == "watch" and i["active"]),
+            "lastScan": watch.get("lastScan"),
+        },
+        "listen": {
+            "enabled": bool(listen.get("enabled")),
+            "leaks": sum(1 for i in flagged if i["source"] == "listen" and i["active"]
+                         and i["severity"] == "leak"),
+            "unknownHosts": int(listen.get("unknownCount") or 0),
+            "retentionHours": listen.get("retentionHours"),
+        },
+    }
+
+
+def write_summary(ctx, rep):
+    ctx.watch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_write(ctx.watch_dir / "summary.json", json.dumps(summary(rep), indent=2) + "\n",
+                 mode=0o600)
+
+
+def notify(ctx, st, rep):
+    """One desktop notification per problem, and another only after it has
+    gone or its colour has changed. The text names the protection or the
+    program and its colour, and never a host."""
+    by_id = {r["id"]: r for r in rep["rows"]}
+    wanted = {}
+    for i in rep["leaks"] + rep["slipped"] + rep["unapplied"] + rep["attention"]:
+        wanted[f"{i}:{by_id[i]['colour']}"] = ("row", by_id[i])
+    for item in rep["flagged"]:
+        if item["active"]:
+            wanted[f"flag/{item['id']}:{item['colour']}"] = ("flag", item)
+    before = set(st["notified"])
+    slipped = set(rep["slipped"])
+    unapplied = set(rep["unapplied"])
+    for key, (kind, what) in wanted.items():
+        if key in before:
+            continue
+        colour = key.rsplit(":", 1)[1]
+        if kind == "flag" and colour == "red":
+            title = f"Black Ops, red: {what['program']} contacted a telemetry host"
+            body = "Listen mode saw it happen. Open the panel to see when, and review it."
+        elif kind == "flag":
+            title = f"Black Ops: {what['program']} is flagged for review"
+            body = "The software watch found telemetry in it. Open the panel to review it."
+        elif colour == "red":
+            title = f"Black Ops, red: {what['label']} saw a telemetry contact"
+            body = "Open the panel to see which program, and review it."
+        elif what["id"] in slipped:
+            title = f"Black Ops: {what['label']} has slipped"
+            body = "Open the panel and switch it on again to put it back."
+        elif what["id"] in unapplied:
+            title = f"Black Ops: {what['label']} is not applied yet"
+            body = "Open the panel and switch it on again to apply it."
+        else:
+            title = f"Black Ops: {what['label']} needs attention"
+            body = "Nothing is exposed yet. Open the panel to see why."
+        ctx.run(["notify-send", "-a", "Black Ops", "-u",
+                 "critical" if colour == "red" else "normal", title, body], timeout=5)
+    changed = set(wanted) != before
+    st["notified"] = sorted(wanted)
+    return changed
+
+
+def as_text(rep):
+    marks = {"ok": "on ", "warn": "!  ", "leak": "!!!", "off": "off", "na": "n/a"}
+    out = [f"Black Ops: {rep['headline']}"]
+    for r in rep["rows"]:
+        line = f"  [{marks.get(r['status'], '?  ')}] {r['label']}: {r['value']}"
+        if r["optional"] and not r["intended"] and r["status"] != "na":
+            line += "  (optional)"
+        if r["registered"]:
+            line += f"  (from {r['source']})"
+        if r["error"] and r["error"] != rep["helperNote"]:
+            line += f"  ({r['error']})"
+        out.append(line)
+        if r["why"]:
+            out.append(f"        {r['why']}")
+    for item in rep["flagged"]:
+        mark = "!!!" if item["colour"] == "red" else ("!  " if item["active"] else "ok ")
+        out.append(f"  [{mark}] {item['program']}: {item['summary']}  ({item['id']})")
+    for s in rep["rowsD"]["skipped"]:
+        out.append(f"  rows.d: {s['file']} was skipped: {s['why']}")
+    if rep["helperNote"]:
+        out.append("  " + rep["helperNote"])
+    return "\n".join(out)
+
+
+def current_report(ctx):
+    """A fresh status, with the state file and summary.json brought up to
+    date, for an extension to print after it has changed something. It is
+    the same report `black-ops status` prints."""
+    with locked(ctx):
+        st, stale = load_state(ctx)
+        before = json.dumps(st, sort_keys=True)
+        rep = status(ctx, st)
+        if stale or json.dumps(st, sort_keys=True) != before:
+            save_state(ctx, st)
+        with contextlib.suppress(OSError, ActionError):
+            write_summary(ctx, rep)
+    return rep
+
+
+def ext_cli(name, argv, ctx):
+    """`black-ops watch ...`, `black-ops review ...` and `black-ops listen
+    ...` belong to the extensions; see docs/contract.md."""
+    module = EXT.get(name)
+    if module is None or not hasattr(module, "cli"):
+        print(f"black-ops: {name} is not part of this version"
+              + (f" ({EXT_ERRORS[name]})" if EXT_ERRORS.get(name) else ""), file=sys.stderr)
+        return 2
+    return int(module.cli(ctx, API, argv) or 0)
+
+
+def main(argv=None, environ=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in ("watch", "review"):
+        return ext_cli("watch", argv, Context(environ))
+    if argv and argv[0] == "listen":
+        return ext_cli("listen", argv, Context(environ))
+    ap = argparse.ArgumentParser(prog="black-ops", description=__doc__.split("\n")[0])
+    ap.add_argument("command", nargs="?", default="status",
+                    choices=["status", "on", "off", "row", "pair"])
+    ap.add_argument("row_id", nargs="?")
+    ap.add_argument("row_state", nargs="?", choices=["on", "off"])
+    ap.add_argument("--notify", action="store_true",
+                    help="send a desktop notification for each new problem")
+    ap.add_argument("--heal", action="store_true",
+                    help="put back what is known to reset itself, such as Bluetooth pairing")
+    ap.add_argument("--pretty", action="store_true")
+    ap.add_argument("--text", action="store_true")
+    args = ap.parse_args(argv)
+    ctx = Context(environ)
+    problem = ""
+    st, stale = load_state(ctx)
+    due = version_due(ctx, st)[2]
+    if args.command == "status" and not args.notify and not args.heal and not stale and not due:
+        rep = status(ctx, st)
+    else:
+        # A state file from an earlier version is rewritten on the first run
+        # that sees it, a plain status included, so rows that have left
+        # Black Ops are forgotten at once and never reverted. The same goes
+        # for the first run after Omarchy has been updated.
+        with locked(ctx):
+            st, stale = load_state(ctx)
+            before = json.dumps(st, sort_keys=True)
+            try:
+                if args.command == "on":
+                    switch_on(ctx, st)
+                elif args.command == "off":
+                    switch_off(ctx, st)
+                elif args.command == "row":
+                    if not args.row_id or not args.row_state:
+                        ap.error("row needs an id and on or off")
+                    switch_row(ctx, st, args.row_id, args.row_state == "on")
+                elif args.command == "pair":
+                    open_pair_window(ctx, st)
+                if args.heal and st["master"]:
+                    heal(ctx, st)
+            except (ActionError, OSError) as exc:
+                problem = message(exc)
+            rep = status(ctx, st)
+            if args.notify and rep["master"]:
+                notify(ctx, st, rep)
+            elif args.notify:
+                st["notified"] = []
+            if stale or json.dumps(st, sort_keys=True) != before:
+                save_state(ctx, st)
+            with contextlib.suppress(OSError, ActionError):
+                write_summary(ctx, rep)
+    if problem:
+        rep["error"] = problem
+    if args.text:
+        print(as_text(rep))
+    else:
+        print(json.dumps(rep, indent=2 if args.pretty else None))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,129 @@
+# Telemetry signatures for the Black Ops software watch and listen mode.
+#
+# The format is fixed in docs/contract.md, section "Signatures". In short:
+# each [[signature]] has an id, a vendor, a kind, the host patterns a
+# program contacts, and the byte strings a static scan looks for in its
+# files. A host pattern is matched with Python's fnmatch.fnmatchcase after
+# both sides are lower-cased and a trailing dot is dropped, so `*` also
+# matches dots. Only kinds telemetry, analytics and crash-report can make a
+# confirmed contact red; the others are shown in amber at most.
+#
+# Add a signature only for a host whose one purpose is collecting usage,
+# error or tracking data. A host that also serves content a program needs
+# does not belong here.
+
+schema = 1
+
+[[signature]]
+id = "datadog-intake"
+vendor = "Datadog"
+kind = "telemetry"
+hosts = ["http-intake.logs.datadoghq.com", "http-intake.logs.*.datadoghq.com",
+         "browser-intake-datadoghq.com", "*.browser-intake-datadoghq.com"]
+strings = ["http-intake.logs.", "browser-intake-datadoghq"]
+about = "Datadog's log and telemetry intake, which Claude Code reports to."
+
+[[signature]]
+id = "sentry-ingest"
+vendor = "Sentry"
+kind = "crash-report"
+hosts = ["*.ingest.sentry.io", "*.ingest.us.sentry.io", "*.ingest.de.sentry.io"]
+strings = [".ingest.sentry.io", ".ingest.us.sentry.io", ".ingest.de.sentry.io"]
+about = "Sentry's error and crash intake."
+
+[[signature]]
+id = "microsoft-1ds"
+vendor = "Microsoft"
+kind = "telemetry"
+hosts = ["*.events.data.microsoft.com", "vortex.data.microsoft.com"]
+strings = ["events.data.microsoft.com", "vortex.data.microsoft.com"]
+about = "Microsoft's 1DS telemetry collector, used by onnxruntime and VS Code."
+
+[[signature]]
+id = "google-analytics"
+vendor = "Google"
+kind = "analytics"
+hosts = ["google-analytics.com", "*.google-analytics.com", "*.analytics.google.com"]
+strings = ["google-analytics.com/", "analytics.google.com/g/collect"]
+about = "Google Analytics collection endpoints."
+
+[[signature]]
+id = "segment"
+vendor = "Segment"
+kind = "analytics"
+hosts = ["api.segment.io", "events.eu1.segmentapis.com"]
+strings = ["api.segment.io", "segmentapis.com"]
+about = "Segment's event collection API."
+
+[[signature]]
+id = "mixpanel"
+vendor = "Mixpanel"
+kind = "analytics"
+hosts = ["api.mixpanel.com", "api-js.mixpanel.com", "api-eu.mixpanel.com"]
+strings = ["api.mixpanel.com", "api-js.mixpanel.com", "api-eu.mixpanel.com"]
+about = "Mixpanel's event collection API."
+
+[[signature]]
+id = "amplitude"
+vendor = "Amplitude"
+kind = "analytics"
+hosts = ["api.amplitude.com", "api2.amplitude.com", "api.eu.amplitude.com"]
+strings = ["api.amplitude.com", "api2.amplitude.com"]
+about = "Amplitude's event collection API."
+
+[[signature]]
+id = "posthog"
+vendor = "PostHog"
+kind = "analytics"
+hosts = ["*.i.posthog.com", "app.posthog.com"]
+strings = ["i.posthog.com", "app.posthog.com"]
+about = "PostHog's cloud event collection."
+
+[[signature]]
+id = "statsig"
+vendor = "Statsig"
+kind = "feature-flags"
+hosts = ["*.statsigapi.net", "featuregates.org", "*.featuregates.org"]
+strings = ["statsigapi.net", "featuregates.org"]
+about = "Statsig feature flags and event logging."
+
+[[signature]]
+id = "bugsnag"
+vendor = "Bugsnag"
+kind = "crash-report"
+hosts = ["notify.bugsnag.com", "sessions.bugsnag.com"]
+strings = ["notify.bugsnag.com", "sessions.bugsnag.com"]
+about = "Bugsnag's error and session intake."
+
+[[signature]]
+id = "debuginfod-arch"
+vendor = "Arch Linux"
+kind = "lookup"
+hosts = ["debuginfod.archlinux.org"]
+strings = ["debuginfod.archlinux.org"]
+about = "Arch's debug symbol server, which learns which builds you debug."
+
+[[signature]]
+id = "nm-connectivity"
+vendor = "Arch Linux"
+kind = "lookup"
+hosts = ["ping.archlinux.org"]
+strings = ["ping.archlinux.org/nm-check.txt"]
+about = "NetworkManager's connectivity check page."
+
+[[signature]]
+id = "mozilla-telemetry"
+vendor = "Mozilla"
+kind = "telemetry"
+hosts = ["incoming.telemetry.mozilla.org"]
+strings = ["incoming.telemetry.mozilla.org"]
+about = "Mozilla's telemetry and Glean ping intake, used by Firefox and browsers built on it."
+
+[[signature]]
+id = "brave-usage"
+vendor = "Brave"
+kind = "telemetry"
+hosts = ["usage-ping.brave.com", "p3a.brave.com", "p3a-json.brave.com", "p2a.brave.com",
+         "p2a-json.brave.com", "star-randsrv.bsg.brave.com"]
+strings = ["usage-ping.brave.com", "p3a-json.brave.com", "p2a-json.brave.com", "star-randsrv.bsg.brave.com"]
+about = "Brave's daily usage ping and its privacy-preserving product analytics (P3A)."

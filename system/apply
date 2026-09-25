@@ -1,0 +1,987 @@
+#!/usr/bin/python3 -I
+"""The root half of the Black Ops bar plugin.
+
+This file is installed by bin/black-ops-install as
+/usr/local/lib/omarchy-black-ops/apply, owned by root, and a sudoers drop-in
+lets one account run it without a password with exactly one of the verbs
+below as its only argument. Everything the plugin does that needs root is
+here, and nothing else is.
+
+The rules it keeps:
+
+- It accepts one argument, and that argument must be one of VERBS. No verb
+  takes a path, a host name or any other text, so the account allowed to run
+  it can choose which of these few changes to make and nothing more.
+- It refuses to run unless it is root, and unless its own file and every
+  folder above it are owned by root and writable by nobody else. A copy that
+  someone else could edit is not a copy worth trusting with root.
+- It never follows a symbolic link when it writes. Folders are opened one
+  component at a time with O_NOFOLLOW, files are written to a new name in the
+  same folder and renamed over the old one, and a target that turns out to be
+  a link is refused rather than written through.
+- It prints one short line saying what it did, and never the contents of a
+  file. It keeps no log of its own.
+
+Python is started with -I, so no environment variable and no user site folder
+can change which modules it loads. Commands it runs are given by absolute path
+with a fixed, minimal environment.
+"""
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+# The plugin version this helper belongs to. `version` prints it, and
+# bin/black-ops compares the installed copy with the one in the plugin folder
+# so the panel can say when the one-time install needs running again.
+HELPER_VERSION = "0.4.0"
+
+VERBS = (
+    "version",
+    "hosts-on",
+    "hosts-off",
+    "dns-on",
+    "dns-off",
+    "identity-on",
+    "identity-off",
+    "chromium-on",
+    "chromium-off",
+    "connectivity-on",
+    "connectivity-off",
+    "avahi-on",
+    "avahi-off",
+    "herdr-block-on",
+    "herdr-block-off",
+    "localsend-close",
+    "localsend-open",
+    "fwupd-p2p-on",
+    "fwupd-p2p-off",
+    "listen-on",
+    "listen-off",
+    "listen-purge",
+    "bt-privacy-on",
+    "bt-privacy-off",
+    "avahi-mask",
+    "avahi-unmask",
+)
+
+# Where things live. These are constants rather than settings, because a root
+# helper that could be pointed somewhere else would be a way to write anywhere.
+# The tests replace them on the imported module, which is the only way they
+# change.
+TRUSTED_UID = 0
+TRUSTED_BASE = "/etc"
+ETC = "/etc"
+HOSTS_NAME = "hosts"
+RESOLVED_DROPIN_DIR = "/etc/systemd/resolved.conf.d"
+DNS_DROPIN_NAME = "no-fallback.conf"
+NM_CONF_DIR = "/etc/NetworkManager/conf.d"
+IDENTITY_NAME = "90-black-ops-identity.conf"
+CONNECTIVITY_NAME = "90-black-ops-connectivity.conf"
+CHROMIUM_POLICY_DIR = "/etc/chromium/policies/managed"
+CHROMIUM_POLICY_NAME = "black-ops.json"
+AVAHI_DIR = "/etc/avahi"
+AVAHI_NAME = "avahi-daemon.conf"
+FWUPD_DIR = "/etc/fwupd"
+FWUPD_NAME = "fwupd.conf"
+BT_DIR = "/etc/bluetooth"
+BT_NAME = "main.conf"
+AVAHI_UNIT_FILE = "/usr/lib/systemd/system/avahi-daemon.service"
+RESOLVECTL = "/usr/bin/resolvectl"
+SYSTEMCTL = "/usr/bin/systemctl"
+NMCLI = "/usr/bin/nmcli"
+UFW = "/usr/bin/ufw"
+CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+LISTEN_SERVICE = "omarchy-black-ops-listen.service"
+LISTEN_UNIT = "/etc/systemd/system/omarchy-black-ops-listen.service"
+LISTEN_CONF = "/etc/omarchy-black-ops/listen.conf"
+LISTEN_RUN = "/run/black-ops-listen"
+LISTEN_KEEP = "/var/log/black-ops-listen"
+LISTEN_SIGNAL_WAIT = 1.0
+
+# The host names the block holds, in two groups that are switched on and off
+# separately. They are fixed here and in bin/black-ops, and a test checks that
+# the lists agree.
+TELEMETRY_HOSTS = (
+    "http-intake.logs.us5.datadoghq.com",     # Claude Code Datadog
+)
+HERDR_HOSTS = (
+    "herdr.dev",                              # herdr's version and manifest checks
+)
+MANAGED_HOSTS = TELEMETRY_HOSTS + HERDR_HOSTS
+SINKS = ("0.0.0.0", "::")
+
+BEGIN = "# BEGIN black-ops"
+END = "# END black-ops"
+BLOCK_NOTE = "# Managed by the Black Ops bar plugin. Switch it off there rather than editing here."
+
+# Hosts that version 0.1 kept inside the block and that now belong to the
+# apps they concern. Their lines are moved out of the block, just above it,
+# as plain lines under these comments, so they stay blocked and Black Ops no
+# longer removes them. Nightloom's setup recognises plain lines like these as
+# already in place. Any other line found inside the block is moved out too,
+# without a comment, rather than lost.
+HANDED_OVER = (
+    ("# onnxruntime telemetry and ComfyUI Sentry, blocked for Nightloom",
+     ("mobile.events.data.microsoft.com", "o4507954455314432.ingest.us.sentry.io")),
+    ("# ollama.com, blocked for Nightloom",
+     ("ollama.com",)),
+)
+
+DNS_DROPIN = """\
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# An empty FallbackDNS= means systemd-resolved never falls back to its
+# compiled-in public resolvers when the configured ones stop answering.
+[Resolve]
+FallbackDNS=
+"""
+
+IDENTITY_DROPIN = """\
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# Defaults for every connection profile that leaves these at their default:
+# no hostname in DHCP requests, a stable per-network MAC address instead of
+# the hardware one, and IPv6 temporary addresses preferred.
+[connection]
+ipv4.dhcp-send-hostname=0
+ipv6.dhcp-send-hostname=0
+wifi.cloned-mac-address=stable
+ethernet.cloned-mac-address=stable
+ipv6.ip6-privacy=2
+"""
+
+CONNECTIVITY_DROPIN = """\
+# Written by the Black Ops bar plugin, and removed when it is switched off.
+# Stops NetworkManager fetching its connectivity-check page on every
+# connection change and at intervals.
+[connectivity]
+enabled=false
+"""
+
+# The Chromium policies, in the order they are written. None of them lowers
+# security: Safe Browsing, component updates and certificate checks are left
+# exactly as Chromium ships them.
+CHROMIUM_POLICIES = (
+    ("SearchSuggestEnabled", False),
+    ("NetworkPredictionOptions", 2),
+    ("AlternateErrorPagesEnabled", False),
+    ("SpellCheckServiceEnabled", False),
+    ("MetricsReportingEnabled", False),
+    ("UrlKeyedAnonymizedDataCollectionEnabled", False),
+    ("BlockThirdPartyCookies", True),
+    ("WebRtcIPHandling", "default_public_interface_only"),
+    ("PrivacySandboxAdTopicsEnabled", False),
+    ("PrivacySandboxSiteEnabledAdsEnabled", False),
+    ("PrivacySandboxAdMeasurementEnabled", False),
+    ("PasswordLeakDetectionEnabled", False),
+    ("BackgroundModeEnabled", False),
+    ("EnableMediaRouter", False),
+)
+
+# Marker lines for the in-place edit of avahi-daemon.conf. The file is the
+# package's own, so the edit is as small as it can be and marked, and
+# switching off puts back exactly what was there.
+AVAHI_MARK = "# black-ops: set by the Black Ops bar plugin, and removed when it is switched off"
+AVAHI_SECTION_MARK = "# black-ops: section added by the Black Ops bar plugin"
+AVAHI_WAS = "#black-ops-was: "
+AVAHI_KEY = "disable-publishing"
+
+# The same kind of marked edit for fwupd.conf, which the package also owns.
+# fwupd reads P2pPolicy from [fwupd]; the key is spelled that way in
+# fwupd.conf(5), and fwupd matches key names exactly.
+FWUPD_MARK = "# black-ops: set by the Black Ops bar plugin, and removed when it is switched off"
+FWUPD_SECTION_MARK = "# black-ops: section added by the Black Ops bar plugin"
+FWUPD_WAS = "#black-ops-was: "
+FWUPD_SECTION = "fwupd"
+FWUPD_KEY = "P2pPolicy"
+FWUPD_VALUE = "nothing"
+
+# And for BlueZ's main.conf. Privacy=device gives the adapter a private
+# address that changes over time on Bluetooth Low Energy; bluetoothd reads it
+# from [General] when it starts.
+BT_MARK = "# black-ops: set by the Black Ops bar plugin, and removed when it is switched off"
+BT_SECTION_MARK = "# black-ops: section added by the Black Ops bar plugin"
+BT_WAS = "#black-ops-was: "
+BT_SECTION = "General"
+BT_KEY = "Privacy"
+BT_VALUE = "device"
+
+# The two units the Avahi daemon verbs mask and unmask, socket first so that
+# nothing can start the service again while it is being stopped.
+AVAHI_UNITS = ("avahi-daemon.socket", "avahi-daemon.service")
+
+# The two rules Omarchy's installer adds for LocalSend, and so the only ones
+# the LocalSend verbs delete or add again. A rule you wrote yourself, such as
+# one limited to your own network, is a different rule and is left alone.
+LOCALSEND_RULES = ("53317/tcp", "53317/udp")
+
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class HelperError(Exception):
+    """A refusal, with a message that is safe to print."""
+
+
+# ------------------------------------------------------------------ checks
+
+def parse_verb(argv):
+    """The verb, or HelperError. Exactly one argument, from the fixed list."""
+    if len(argv) != 2:
+        raise HelperError("expected exactly one verb: " + ", ".join(VERBS))
+    verb = argv[1]
+    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+){0,2}", verb or "") or verb not in VERBS:
+        raise HelperError("unknown verb; expected one of: " + ", ".join(VERBS))
+    return verb
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise HelperError("this helper has to run as root, through sudo")
+
+
+def check_trusted(path, uid=None):
+    """Refuse unless `path` and every folder above it are owned by root (or
+    `uid`) and writable by nobody else."""
+    uid = TRUSTED_UID if uid is None else uid
+    path = os.path.abspath(path)
+    while True:
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            raise HelperError(f"cannot inspect {path}: {exc.strerror}")
+        if stat.S_ISLNK(info.st_mode):
+            raise HelperError(f"{path} is a link; refusing to run from it")
+        if info.st_uid != uid:
+            raise HelperError(f"{path} is not owned by root; refusing to run")
+        if info.st_mode & 0o022:
+            raise HelperError(f"{path} is writable by others; refusing to run")
+        parent = os.path.dirname(path)
+        if parent == path:
+            return
+        path = parent
+
+
+def check_own_install():
+    check_trusted(os.path.realpath(__file__))
+
+
+# ------------------------------------------------------------ file access
+
+def open_dir(path, create_last=False, uid=None, create_below_base=False):
+    """Open a folder one component at a time from /, never following a link.
+    Components at or below TRUSTED_BASE must be owned by root (or `uid`) and
+    writable by nobody else. The last one is made, root's and 0755, when
+    `create_last` is set and it does not exist; with `create_below_base`,
+    any missing component below TRUSTED_BASE is made the same way."""
+    uid = TRUSTED_UID if uid is None else uid
+    path = os.path.abspath(path)
+    parts = [p for p in path.split("/") if p]
+    fd = os.open("/", O_DIR)
+    current = ""
+    try:
+        for i, part in enumerate(parts):
+            if part in (".", ".."):
+                raise HelperError(f"unexpected component in {path}")
+            try:
+                nfd = os.open(part, O_DIR, dir_fd=fd)
+            except FileNotFoundError:
+                below = (current + "/" + part).startswith(os.path.abspath(TRUSTED_BASE) + "/")
+                if not ((create_last and i == len(parts) - 1) or (create_below_base and below)):
+                    raise HelperError(f"{path} does not exist")
+                os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, O_DIR, dir_fd=fd)
+                os.fchmod(nfd, 0o755)
+            except OSError as exc:
+                raise HelperError(f"cannot open {current}/{part} without following links: {exc.strerror}")
+            os.close(fd)
+            fd = nfd
+            current += "/" + part
+            base = os.path.abspath(TRUSTED_BASE)
+            if current == base or current.startswith(base + "/"):
+                info = os.fstat(fd)
+                if info.st_uid != uid or info.st_mode & 0o022:
+                    raise HelperError(f"{current} is not a root-owned folder that only root can write to")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def entry_info(dfd, name):
+    """lstat of a name in an open folder, or None if it is absent."""
+    try:
+        return os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def read_file(dfd, name):
+    info = entry_info(dfd, name)
+    if info is None:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise HelperError(f"{name} is not a plain file; refusing to touch it")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read().decode("utf-8", "surrogateescape")
+
+
+def write_file(dfd, name, text, mode=0o644):
+    """Replace `name` in an open folder with `text`, atomically. The new file
+    is created under a fresh name with O_EXCL and O_NOFOLLOW and renamed into
+    place, so nothing is ever written through a link and a reader never sees
+    half a file. An existing file keeps its owner and mode."""
+    info = entry_info(dfd, name)
+    if info is not None and not stat.S_ISREG(info.st_mode):
+        raise HelperError(f"{name} is not a plain file; refusing to replace it")
+    tmp = f".{name}.black-ops.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 mode, dir_fd=dfd)
+    try:
+        data = text.encode("utf-8", "surrogateescape")
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        if info is not None:
+            os.fchown(fd, info.st_uid, info.st_gid)
+            os.fchmod(fd, stat.S_IMODE(info.st_mode))
+        else:
+            os.fchmod(fd, mode)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp, dir_fd=dfd)
+        raise
+    os.close(fd)
+    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    os.fsync(dfd)
+
+
+def remove_file(dfd, name):
+    """Remove `name` if it is a plain file. Answers whether anything went."""
+    info = entry_info(dfd, name)
+    if info is None:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        raise HelperError(f"{name} is not a plain file; refusing to remove it")
+    os.unlink(name, dir_fd=dfd)
+    os.fsync(dfd)
+    return True
+
+
+def run(cmd):
+    """Run a fixed command with a fixed environment. Failure is reported but
+    does not undo the file change, which is already the state that was asked
+    for."""
+    try:
+        r = subprocess.run(cmd, env=CLEAN_ENV, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ---------------------------------------------------------------- /etc/hosts
+
+def _tokens(line):
+    return line.split("#", 1)[0].split()
+
+
+def split_block(text):
+    """The lines outside the managed block, and the lines inside it (None
+    when there is no block). A begin marker with no end is refused, because
+    guessing where it ends could delete lines that are not ours."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    starts = [i for i, l in enumerate(lines) if l.strip() == BEGIN]
+    ends = [i for i, l in enumerate(lines) if l.strip() == END]
+    if not starts and not ends:
+        return lines, None
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        raise HelperError("the black-ops block in the hosts file is damaged; fix it by hand first")
+    s, e = starts[0], ends[0]
+    return lines[:s] + lines[e + 1:], lines[s + 1:e]
+
+
+def block_hosts(inner):
+    """The host names the block sinks on both families."""
+    v4, v6 = set(), set()
+    for line in inner or []:
+        t = _tokens(line)
+        if len(t) >= 2 and t[0] == "0.0.0.0":
+            v4.update(t[1:])
+        elif len(t) >= 2 and t[0] == "::":
+            v6.update(t[1:])
+    return v4 & v6
+
+
+def strip_hand_lines(outside, hosts):
+    """Take out lines that sink one of `hosts` and nothing else, written the
+    way the block writes them. Anything else is left exactly as it was."""
+    kept = []
+    for line in outside:
+        t = _tokens(line)
+        if "#" not in line and len(t) == 2 and t[0] in SINKS and t[1] in hosts:
+            continue
+        kept.append(line)
+    return kept
+
+
+def not_ours(inner, outside):
+    """Lines inside the block that are not the block's own, split into the
+    groups in HANDED_OVER and a last group of anything else. A line that sinks
+    several names is split into one line per name. Lines the file already has
+    outside the block are not repeated."""
+    have = {tuple(_tokens(l)) for l in outside if "#" not in l}
+    groups = [[] for _ in HANDED_OVER] + [[]]
+    for line in inner or []:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        t = _tokens(line)
+        if len(t) >= 2 and t[0] in SINKS:
+            for host in t[1:]:
+                if host in MANAGED_HOSTS:
+                    continue
+                new = f"{t[0]} {host}"
+                if (t[0], host) in have:
+                    continue
+                have.add((t[0], host))
+                g = next((i for i, (_, names) in enumerate(HANDED_OVER) if host in names),
+                         len(HANDED_OVER))
+                groups[g].append(new)
+        elif tuple(t) not in have:
+            have.add(tuple(t))
+            groups[-1].append(line)
+    out = []
+    for i, lines in enumerate(groups):
+        if lines:
+            if i < len(HANDED_OVER):
+                out.append(HANDED_OVER[i][0])
+            out.extend(lines)
+    return out
+
+
+def render_hosts(outside, moved, hosts):
+    body = list(outside)
+    while body and body[-1].strip() == "":
+        body.pop()
+    if moved:
+        body += [""] + moved
+    if hosts:
+        body += ["", BEGIN, BLOCK_NOTE]
+        for host in hosts:
+            body += [f"0.0.0.0 {host}", f":: {host}"]
+        body.append(END)
+    return "\n".join(body) + "\n"
+
+
+def edit_hosts(text, telemetry=None, herdr=None):
+    """The hosts file with each group of the block switched on (True), off
+    (False) or left as it is (None). Hand-written lines for a group being
+    switched are moved into the block or, when it is switched off, removed
+    with it. Every other line inside the block, including those an earlier
+    version put there, is moved out of it and kept."""
+    outside, inner = split_block(text)
+    have = block_hosts(inner)
+    groups = ((TELEMETRY_HOSTS, telemetry), (HERDR_HOSTS, herdr))
+    strip = set()
+    hosts = []
+    for names, want in groups:
+        if want is None:
+            want = all(h in have for h in names)
+        else:
+            strip.update(names)
+        if want:
+            hosts.extend(names)
+    outside = strip_hand_lines(outside, strip)
+    return render_hosts(outside, not_ours(inner, outside), hosts)
+
+
+def change_hosts(telemetry=None, herdr=None):
+    dfd = open_dir(ETC)
+    try:
+        before = read_file(dfd, HOSTS_NAME)
+        if before is None:
+            raise HelperError("there is no hosts file")
+        info = entry_info(dfd, HOSTS_NAME)
+        if info.st_uid != TRUSTED_UID:
+            raise HelperError("the hosts file is not owned by root; refusing to edit it")
+        after = edit_hosts(before, telemetry, herdr)
+        if after == before:
+            return "unchanged"
+        write_file(dfd, HOSTS_NAME, after)
+    finally:
+        os.close(dfd)
+    run([RESOLVECTL, "flush-caches"])
+    return "changed, caches flushed"
+
+
+# ------------------------------------------------------------ drop-in files
+
+def dropin_on(folder, name, content, restart, create_below_base=False):
+    dfd = open_dir(folder, create_last=True, create_below_base=create_below_base)
+    try:
+        if read_file(dfd, name) == content:
+            changed = False
+        else:
+            write_file(dfd, name, content)
+            changed = True
+    finally:
+        os.close(dfd)
+    if changed:
+        restart()
+    return "changed" if changed else "unchanged"
+
+
+def dropin_off(folder, name, restart, remove_empty=True):
+    parent, leaf = os.path.split(os.path.abspath(folder))
+    try:
+        dfd = open_dir(folder)
+    except HelperError:
+        if not os.path.lexists(folder):
+            return "unchanged"
+        raise
+    try:
+        gone = remove_file(dfd, name)
+        empty = not os.listdir(dfd)
+    finally:
+        os.close(dfd)
+    # The folder is removed too when nothing else is in it. A stock system
+    # has no resolved.conf.d, and leaving an empty one behind is not stock.
+    if gone and empty and remove_empty and leaf.endswith(".d"):
+        pfd = open_dir(parent)
+        try:
+            os.rmdir(leaf, dir_fd=pfd)
+        except OSError:
+            pass
+        finally:
+            os.close(pfd)
+    if gone:
+        restart()
+    return "changed" if gone else "unchanged"
+
+
+def restart_resolved():
+    run([SYSTEMCTL, "restart", "systemd-resolved.service"])
+
+
+def reload_nm():
+    """NetworkManager rereads its configuration files. Connection defaults
+    reach a connection the next time it is activated."""
+    run([NMCLI, "general", "reload", "conf"])
+
+
+def restart_avahi():
+    """Only a running daemon is restarted. A stopped one reads the file when
+    it next starts, and starting it here would be a change of its own."""
+    if run([SYSTEMCTL, "is-active", "--quiet", "avahi-daemon.service"]):
+        run([SYSTEMCTL, "restart", "avahi-daemon.service"])
+
+
+def chromium_policy():
+    lines = ["{"]
+    for i, (key, value) in enumerate(CHROMIUM_POLICIES):
+        comma = "," if i < len(CHROMIUM_POLICIES) - 1 else ""
+        if isinstance(value, bool):
+            v = "true" if value else "false"
+        elif isinstance(value, int):
+            v = str(value)
+        else:
+            v = '"' + value + '"'
+        lines.append(f'  "{key}": {v}{comma}')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------- marked edits: avahi, fwupd and bluetooth
+
+def _ini_key(line):
+    s = line.strip()
+    if not s or s[0] in "#;" or "=" not in s:
+        return None
+    return s.split("=", 1)[0].strip()
+
+
+def _section_bounds(lines, section):
+    """(start, end) of a section's lines, header excluded, or None when the
+    file has no such section."""
+    start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if start is not None:
+                return start, i
+            if s[1:-1].strip() == section:
+                start = i + 1
+    if start is None:
+        return None
+    return start, len(lines)
+
+
+def marked_edit(text, on, section, key, value, mark, section_mark, was):
+    """An ini file with `key=value` in `section` switched on or off. On adds
+    two marked lines to the section and comments out, with a marker, any
+    other line for the key there. Off takes out what on added and puts back
+    what it commented out, so the file returns byte for byte."""
+    lines = text.split("\n")
+    # Off first, always, so that on is the same edit whatever it starts from.
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line == mark:
+            if i + 1 < len(lines) and lines[i + 1].strip() == f"{key}={value}":
+                i += 1
+            i += 1
+            continue
+        if line.startswith(was):
+            out.append(line[len(was):])
+            i += 1
+            continue
+        if line == section_mark:
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    lines = out
+    # A section the plugin added is taken out once it is empty.
+    if section_mark in text:
+        b = _section_bounds(lines, section)
+        if b and all(not l.strip() for l in lines[b[0]:b[1]]):
+            ended = lines[-1] == ""
+            del lines[b[0] - 1:b[1]]
+            if ended and (not lines or lines[-1] != ""):
+                lines.append("")
+    if not on:
+        return "\n".join(lines)
+    b = _section_bounds(lines, section)
+    if b is None:
+        tail = [section_mark, f"[{section}]", mark, f"{key}={value}"]
+        if lines and lines[-1] == "":
+            lines = lines[:-1] + tail + [""]
+        else:
+            lines = lines + tail
+        return "\n".join(lines)
+    start, end = b
+    at = start
+    for j in range(start, end):
+        if _ini_key(lines[j]) == key:
+            lines[j] = was + lines[j]
+        elif lines[j].strip().lstrip("#;").split("=", 1)[0].strip() == key and at == start:
+            at = j + 1
+    lines[at:at] = [mark, f"{key}={value}"]
+    return "\n".join(lines)
+
+
+def avahi_edit(text, on):
+    """avahi-daemon.conf with disable-publishing=yes in [publish]."""
+    return marked_edit(text, on, "publish", AVAHI_KEY, "yes",
+                       AVAHI_MARK, AVAHI_SECTION_MARK, AVAHI_WAS)
+
+
+def fwupd_edit(text, on):
+    """fwupd.conf with P2pPolicy=nothing in [fwupd]."""
+    return marked_edit(text, on, FWUPD_SECTION, FWUPD_KEY, FWUPD_VALUE,
+                       FWUPD_MARK, FWUPD_SECTION_MARK, FWUPD_WAS)
+
+
+def change_marked(folder, name, edit, on, restart, what):
+    """Apply `edit` to a root-owned package file in place, or take it out."""
+    try:
+        dfd = open_dir(folder)
+    except HelperError:
+        if not os.path.lexists(folder):
+            if on:
+                raise HelperError(f"{what} is not installed")
+            return "unchanged"
+        raise
+    try:
+        before = read_file(dfd, name)
+        if before is None:
+            if on:
+                raise HelperError(f"there is no {name}")
+            return "unchanged"
+        if entry_info(dfd, name).st_uid != TRUSTED_UID:
+            raise HelperError(f"{name} is not owned by root; refusing to edit it")
+        after = edit(before, on)
+        if after == before:
+            return "unchanged"
+        write_file(dfd, name, after)
+    finally:
+        os.close(dfd)
+    restart()
+    return "changed"
+
+
+def change_avahi(on):
+    return change_marked(AVAHI_DIR, AVAHI_NAME, avahi_edit, on, restart_avahi, "avahi")
+
+
+def restart_fwupd():
+    """fwupd rereads its configuration when it starts. It is started on
+    demand, so only a running one is restarted."""
+    run([SYSTEMCTL, "try-restart", "fwupd.service"])
+
+
+def change_fwupd(on):
+    return change_marked(FWUPD_DIR, FWUPD_NAME, fwupd_edit, on, restart_fwupd, "fwupd")
+
+
+def bt_privacy_edit(text, on):
+    """main.conf with Privacy=device in [General]."""
+    return marked_edit(text, on, BT_SECTION, BT_KEY, BT_VALUE,
+                       BT_MARK, BT_SECTION_MARK, BT_WAS)
+
+
+def restart_bluetooth():
+    """bluetoothd reads Privacy only when it starts, so a running one is
+    restarted. Connected devices drop for a moment and reconnect, and BlueZ
+    makes the adapter pairable again; bin/black-ops turns that back off."""
+    run([SYSTEMCTL, "try-restart", "bluetooth.service"])
+
+
+def change_bt_privacy(on):
+    return change_marked(BT_DIR, BT_NAME, bt_privacy_edit, on, restart_bluetooth, "BlueZ")
+
+
+# ------------------------------------------------------------ avahi daemon
+
+def avahi_mask():
+    """Stop the Avahi daemon and mask it, so neither its socket nor D-Bus
+    can start it again."""
+    if not os.path.exists(AVAHI_UNIT_FILE):
+        raise HelperError("avahi is not installed")
+    if not run([SYSTEMCTL, "mask", "--now", *AVAHI_UNITS]):
+        raise HelperError("systemctl could not mask the avahi daemon")
+    return "changed"
+
+
+def avahi_unmask():
+    """Unmask the daemon and start again whichever of its units is enabled,
+    which is how Omarchy ships it. Masking leaves the enablement alone."""
+    if not run([SYSTEMCTL, "unmask", *AVAHI_UNITS]):
+        raise HelperError("systemctl could not unmask the avahi daemon")
+    for unit in AVAHI_UNITS:
+        if run([SYSTEMCTL, "is-enabled", "--quiet", unit]):
+            run([SYSTEMCTL, "start", unit])
+    return "changed"
+
+
+# --------------------------------------------------------------- firewall
+
+def localsend(open_it):
+    """Delete Omarchy's two LocalSend rules, or add them again. ufw applies
+    each to IPv4 and IPv6 together."""
+    if not os.path.exists(UFW):
+        raise HelperError("ufw is not installed")
+    for rule in LOCALSEND_RULES:
+        cmd = [UFW, "allow", rule] if open_it else [UFW, "delete", "allow", rule]
+        if not run(cmd):
+            raise HelperError(f"ufw could not {'add' if open_it else 'delete'} the rule for {rule}")
+    return "changed"
+
+
+# ------------------------------------------------------------- listen mode
+
+def listen_active():
+    return run([SYSTEMCTL, "is-active", "--quiet", LISTEN_SERVICE])
+
+
+def listen_on():
+    if not os.path.isfile(LISTEN_UNIT):
+        raise HelperError("listen mode is not installed; run bin/black-ops-install first")
+    if not run([SYSTEMCTL, "enable", "--now", LISTEN_SERVICE]):
+        raise HelperError("systemctl could not start the listen service")
+    return "changed"
+
+
+def listen_off():
+    if os.path.isfile(LISTEN_UNIT):
+        if not run([SYSTEMCTL, "disable", "--now", LISTEN_SERVICE]):
+            raise HelperError("systemctl could not stop the listen service")
+    listen_purge()
+    return "changed"
+
+
+def wipe_in(dfd, name):
+    """Overwrite a plain file in an open folder with zeros and unlink it,
+    never following a link. Anything that is not a plain file is unlinked
+    without being opened."""
+    info = entry_info(dfd, name)
+    if info is None:
+        return
+    if stat.S_ISDIR(info.st_mode):
+        return
+    if stat.S_ISREG(info.st_mode):
+        fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+        try:
+            size = os.fstat(fd).st_size
+            block = b"\0" * 65536
+            done = 0
+            while done < size:
+                done += os.write(fd, block[:min(len(block), size - done)])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    os.unlink(name, dir_fd=dfd)
+
+
+def wipe_folder(path):
+    """Wipe every file directly in a root-owned folder. A folder that is
+    missing is already clean."""
+    if not os.path.lexists(path):
+        return 0
+    dfd = open_dir(path)
+    try:
+        info = os.fstat(dfd)
+        if info.st_uid != TRUSTED_UID or info.st_mode & 0o022:
+            raise HelperError(f"{path} is not a folder only root can write to; refusing to touch it")
+        names = os.listdir(dfd)
+        for name in names:
+            wipe_in(dfd, name)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return len(names)
+
+
+def listen_account_gid():
+    """The group of the account named in listen.conf, which may read the
+    view, or None, in which case only root can."""
+    import pwd
+    try:
+        with open(LISTEN_CONF, encoding="utf-8") as fh:
+            text = fh.read(65536)
+    except OSError:
+        return None
+    m = re.search(r"^Account=([a-z_][a-z0-9_-]{0,31})\s*$", text, re.M)
+    try:
+        return pwd.getpwnam(m.group(1)).pw_gid if m else None
+    except KeyError:
+        return None
+
+
+def listen_retention():
+    try:
+        with open(LISTEN_CONF, encoding="utf-8") as fh:
+            m = re.search(r"^RetentionHours=([0-9]{1,6})\s*$", fh.read(65536), re.M)
+    except OSError:
+        m = None
+    return min(720, max(1, int(m.group(1)))) if m else 72
+
+
+def listen_purge():
+    """Overwrite and remove everything listen mode has recorded, in RAM and,
+    if it was kept there, on disk. Files go first, then a running listener
+    is told to forget what it holds, which also removes anything it wrote in
+    between; a stopped one gets an empty view in place of the old."""
+    for folder in (LISTEN_RUN + "/segments", LISTEN_KEEP + "/segments", LISTEN_RUN + "/view"):
+        wipe_folder(folder)
+    if listen_active():
+        run([SYSTEMCTL, "kill", "--kill-whom=main", "--signal=SIGUSR1", LISTEN_SERVICE])
+        time.sleep(LISTEN_SIGNAL_WAIT)
+    elif os.path.isdir(LISTEN_RUN + "/view") and not os.path.islink(LISTEN_RUN + "/view"):
+        now = int(time.time())
+        doc = ('{"schema":1,"generatedAt":%d,"since":%d,"retentionHours":%d,"segments":0,'
+               '"probe":null,"probeRunning":false,"dnsConnected":false,"contacts":[]}\n'
+               % (now, now, listen_retention()))
+        dfd = open_dir(LISTEN_RUN + "/view")
+        try:
+            write_file(dfd, "contacts.json", doc, mode=0o640)
+            gid = listen_account_gid()
+            if gid is not None and entry_info(dfd, "contacts.json").st_gid != gid:
+                os.chown("contacts.json", TRUSTED_UID, gid, dir_fd=dfd, follow_symlinks=False)
+        finally:
+            os.close(dfd)
+    return "purged"
+
+
+# ------------------------------------------------------------------ dispatch
+
+def dispatch(verb):
+    if verb == "hosts-on":
+        return change_hosts(telemetry=True)
+    if verb == "hosts-off":
+        return change_hosts(telemetry=False)
+    if verb == "herdr-block-on":
+        return change_hosts(herdr=True)
+    if verb == "herdr-block-off":
+        return change_hosts(herdr=False)
+    if verb == "dns-on":
+        return dropin_on(RESOLVED_DROPIN_DIR, DNS_DROPIN_NAME, DNS_DROPIN, restart_resolved)
+    if verb == "dns-off":
+        return dropin_off(RESOLVED_DROPIN_DIR, DNS_DROPIN_NAME, restart_resolved)
+    if verb == "identity-on":
+        return dropin_on(NM_CONF_DIR, IDENTITY_NAME, IDENTITY_DROPIN, reload_nm)
+    if verb == "identity-off":
+        return dropin_off(NM_CONF_DIR, IDENTITY_NAME, reload_nm, remove_empty=False)
+    if verb == "connectivity-on":
+        return dropin_on(NM_CONF_DIR, CONNECTIVITY_NAME, CONNECTIVITY_DROPIN, reload_nm)
+    if verb == "connectivity-off":
+        return dropin_off(NM_CONF_DIR, CONNECTIVITY_NAME, reload_nm, remove_empty=False)
+    if verb == "chromium-on":
+        return dropin_on(CHROMIUM_POLICY_DIR, CHROMIUM_POLICY_NAME, chromium_policy(),
+                         lambda: None, create_below_base=True)
+    if verb == "chromium-off":
+        return dropin_off(CHROMIUM_POLICY_DIR, CHROMIUM_POLICY_NAME, lambda: None,
+                          remove_empty=False)
+    if verb == "avahi-on":
+        return change_avahi(True)
+    if verb == "avahi-off":
+        return change_avahi(False)
+    if verb == "localsend-close":
+        return localsend(False)
+    if verb == "localsend-open":
+        return localsend(True)
+    if verb == "fwupd-p2p-on":
+        return change_fwupd(True)
+    if verb == "fwupd-p2p-off":
+        return change_fwupd(False)
+    if verb == "listen-on":
+        return listen_on()
+    if verb == "listen-off":
+        return listen_off()
+    if verb == "listen-purge":
+        return listen_purge()
+    if verb == "bt-privacy-on":
+        return change_bt_privacy(True)
+    if verb == "bt-privacy-off":
+        return change_bt_privacy(False)
+    if verb == "avahi-mask":
+        return avahi_mask()
+    if verb == "avahi-unmask":
+        return avahi_unmask()
+    raise HelperError("unknown verb")
+
+
+def main(argv=None, env=None):
+    argv = sys.argv if argv is None else argv
+    try:
+        verb = parse_verb(argv)
+    except HelperError as exc:
+        print(f"black-ops apply: {exc}", file=sys.stderr)
+        return 2
+    if verb == "version":
+        # Reads nothing and changes nothing, so it answers before the checks.
+        print(f"version: {HELPER_VERSION}")
+        return 0
+    try:
+        require_root()
+        check_own_install()
+        os.umask(0o022)
+        result = dispatch(verb)
+    except HelperError as exc:
+        print(f"black-ops apply: {verb}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"black-ops apply: {verb}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    print(f"{verb}: {result}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
