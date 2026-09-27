@@ -162,6 +162,16 @@ WEBAPP_LAUNCHER = "omarchy-launch-webapp"
 WEBAPP_MARK = "X-Black-Ops-Exec"
 LOCALSEND_TUPLE = re.compile(
     r"^### tuple ### allow (tcp|udp) 53317 (?:0\.0\.0\.0/0|::/0) any (?:0\.0\.0\.0/0|::/0) in(?:\s|$)")
+# Link-local multicast, which routers never forward, and the connection types
+# that reach the local network. system/apply holds the same values.
+LAN_ROUTE = "224.0.0.0/24"
+LAN_TYPES = ("802-3-ethernet", "802-11-wireless")
+# An ipv4.routes entry for that network with no next hop and at most a
+# metric. Any other entry, such as one with a gateway or a table of its own,
+# is not the LAN discovery route.
+LAN_ROUTE_ENTRY = re.compile(r"224\.0\.0\.0/24(?: 0\.0\.0\.0)?(?: [0-9]{1,10})?")
+NM_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+IFNAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@-]{0,14}")
 
 # The status each row can have, and the one colour each stands for. The
 # panel and the bar draw these names and decide nothing themselves.
@@ -1747,6 +1757,101 @@ class LocalSendRow(Row):
             ctx.helper("localsend-open")
 
 
+def lan_connections(ctx):
+    """(uuid, device) for each active Ethernet and Wi-Fi connection, or None
+    when NetworkManager cannot be asked. A VPN, WireGuard, bridge, dummy or
+    loopback connection is not one. Asked with nmcli, which works as an
+    ordinary user; a line that is not exactly what nmcli prints for such a
+    connection is skipped."""
+    if not ctx.which("nmcli"):
+        return None
+    rc, out, _ = ctx.run(["nmcli", "-t", "-f", "UUID,TYPE,DEVICE", "connection", "show",
+                          "--active"], timeout=5)
+    if rc != 0:
+        return None
+    found = []
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) == 3 and parts[1] in LAN_TYPES and NM_UUID.fullmatch(parts[0]) \
+                and IFNAME.fullmatch(parts[2]):
+            found.append((parts[0], parts[2]))
+    return found
+
+
+def lan_route_devices(ctx):
+    """The devices the main routing table sends 224.0.0.0/24 to, or None
+    when `ip` is not there to ask."""
+    if not ctx.which("ip"):
+        return None
+    rc, out, _ = ctx.run(["ip", "-4", "route", "show", "exact", LAN_ROUTE, "table", "main"],
+                         timeout=5)
+    if rc != 0:
+        return None
+    found = set()
+    for line in out.splitlines():
+        m = re.search(r" dev (\S+)", line)
+        if line.startswith(LAN_ROUTE + " ") and " via " not in line and m:
+            found.add(m.group(1))
+    return found
+
+
+class LanDiscoveryRow(Row):
+    id = "lan-discovery"
+    label = "LAN discovery over a VPN"
+    privileged = True
+    optional = True
+    about = ("Costs nothing, and changes nothing while no VPN is connected. A VPN that "
+             "sends everything through its tunnel also takes link-local multicast, which "
+             "LocalSend and similar tools use to find each other, so this machine "
+             "disappears from them on the local network. Switching this on adds the route "
+             "224.0.0.0/24 to each Ethernet and Wi-Fi connection, which keeps that "
+             "multicast, mDNS included, on the local network as it would be without the "
+             "VPN. Routers never forward these addresses, so nothing leaves the local "
+             "network and nothing else goes around the VPN. A network you join for the "
+             "first time does not have the route until this is switched on again.")
+
+    def check(self, ctx, rec=None):
+        lans = lan_connections(ctx)
+        if lans is None:
+            return result("na", "no NetworkManager",
+                          "NetworkManager is not installed or not running.")
+        if not lans:
+            return result("na", "no local network",
+                          "No Ethernet or Wi-Fi connection is active.")
+        missing = []
+        for uuid, device in lans:
+            rc, out, _ = ctx.run(["nmcli", "-g", "ipv4.routes", "connection", "show", uuid],
+                                 timeout=5)
+            entries = [e.strip() for e in out.split(",")] if rc == 0 else []
+            if not any(LAN_ROUTE_ENTRY.fullmatch(e) for e in entries):
+                missing.append(device)
+        # Devices are named, never connection profiles, since a Wi-Fi name can
+        # say where you have been.
+        if missing:
+            return result("out", "not set for " + ", ".join(missing), self.about,
+                          why="The connection on " + ", ".join(missing)
+                              + (" has" if len(missing) == 1 else " have")
+                              + " no route for 224.0.0.0/24, so while a VPN is connected "
+                              "this machine cannot be found on that network.")
+        value = "on the local network" if rec else "on the local network, by hand"
+        live = lan_route_devices(ctx)
+        waiting = [d for _, d in lans if live is not None and d not in live]
+        if waiting:
+            return result("in", value, self.about, work=True, attention=(
+                "The route is saved for " + ", ".join(waiting) + " but not in effect yet. "
+                "Switch this row on again to add it now; it is also added when the "
+                "connection next comes up."))
+        return result("in", value, self.about)
+
+    def apply(self, ctx, chk, rec):
+        ctx.helper("lan-discovery-on")
+
+    def revert(self, ctx, rec):
+        # Also takes the route out of saved connections that are not active,
+        # such as a Wi-Fi network it was added to last week.
+        ctx.helper("lan-discovery-off")
+
+
 # ------------------------------------------------------- developer tools
 
 TOML_HEADER = re.compile(r"^\s*\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(?:#.*)?$")
@@ -2533,8 +2638,8 @@ ROWS = [WeatherRow(), AgentsRow(), DnsRow(), ClaudeRow(), HostsRow(),
         BluetoothRow(), IdentityRow(), ChromiumRow(), ConnectivityRow(), AvahiRow(),
         WebappsRow(), DevTelemetryRow(), NvimCheckerRow(), OptOutRow(),
         # Optional: off until switched on one by one.
-        UpdateBadgeRow(), HerdrRow(), LocalSendRow(), DebuginfodRow(), CrashWatchRow(),
-        FwupdRow(), AvahiDaemonRow(), BtPrivacyRow(), ClaudeUsageRow()]
+        UpdateBadgeRow(), HerdrRow(), LocalSendRow(), LanDiscoveryRow(), DebuginfodRow(),
+        CrashWatchRow(), FwupdRow(), AvahiDaemonRow(), BtPrivacyRow(), ClaudeUsageRow()]
 
 
 # ------------------------------------------------------- phase 2 extensions

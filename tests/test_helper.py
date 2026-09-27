@@ -7,7 +7,8 @@ import sys
 
 import pytest
 
-from conftest import HAND_HOSTS, HOSTS_01, HOSTS_01_OLLAMA, REPO, STOCK_HOSTS
+from conftest import (HAND_HOSTS, HOSTS_01, HOSTS_01_OLLAMA, REPO, STOCK_HOSTS, lan_con,
+                      lan_machine, lan_state)
 
 # Verbs 0.1 had. The 0.2 helper refuses them, and the rule no longer names
 # them, so after the installer has run once more they stop working.
@@ -52,6 +53,10 @@ def test_every_verb_is_accepted(helper, verb):
     ["apply", "shell"],
     ["apply", "--help"],
     ["apply", "version", "x"],
+    ["apply", "lan-discovery-on", "eth0"],
+    ["apply", "lan-discovery-off", "Home Wi-Fi"],
+    ["apply", "lan-discovery-on", "224.0.0.0/24"],
+    ["apply", "lan-discovery"],
 ] + [["apply", verb] for verb in REMOVED_VERBS])
 def test_anything_else_is_refused(helper, argv):
     with pytest.raises(helper.HelperError):
@@ -278,3 +283,97 @@ def test_removed_verbs_stop_working_after_reinstalling(sandbox, helper, verb):
     assert sandbox.snapshot() == before
     # And the new helper refuses it on its own, whatever sudo allows.
     assert helper.main(["apply", verb], {}) == 2
+
+
+# ------------------------------------------------------ LAN discovery verbs
+
+WIRED = "11111111-2222-4333-8444-555555555555"
+WIFI = "66666666-7777-4888-9999-aaaaaaaaaaaa"
+ENDPOINT = "203.0.113.7/32 192.168.1.1"
+
+
+def routes_of(sandbox, uuid):
+    return next(c["routes"] for c in lan_state(sandbox)["connections"] if c["uuid"] == uuid)
+
+
+def no_bounce(sandbox):
+    for c in sandbox.calls("nmcli "):
+        assert not any(w in c.split() for w in ("up", "down", "reapply")), c
+
+
+@pytest.mark.parametrize("verb", ["lan-discovery-on", "lan-discovery-off"])
+def test_lan_discovery_verbs_are_accepted(helper, verb):
+    assert helper.parse_verb(["apply", verb]) == verb
+
+
+def test_lan_discovery_on_is_idempotent_and_leaves_other_routes(sandbox):
+    lan_machine(sandbox, [lan_con(WIRED, "802-3-ethernet", "eth0", routes=[ENDPOINT]),
+                          lan_con(WIFI, "802-11-wireless", "wlan0"),
+                          lan_con("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "wireguard", "wg0",
+                                  routes=["10.2.0.0/16"])])
+    r = call(sandbox, "lan-discovery-on")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "lan-discovery-on: changed"
+    assert routes_of(sandbox, WIRED) == [ENDPOINT, "224.0.0.0/24"]
+    assert routes_of(sandbox, WIFI) == ["224.0.0.0/24"]
+    assert routes_of(sandbox, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff") == ["10.2.0.0/16"]
+    assert sorted(lan_state(sandbox)["live"], key=lambda r: r["dev"]) == [
+        {"dev": "eth0", "metric": "100"}, {"dev": "wlan0", "metric": "600"}]
+    sandbox.clear_calls()
+    r = call(sandbox, "lan-discovery-on")
+    assert r.stdout.strip() == "lan-discovery-on: unchanged"
+    assert not [c for c in sandbox.calls("nmcli ") if " modify " in c]
+    assert not [c for c in sandbox.calls("ip ") if " replace " in c]
+    no_bounce(sandbox)
+
+
+def test_lan_discovery_on_never_replaces_another_devices_route(sandbox):
+    lan_machine(sandbox, [lan_con(WIRED, "802-3-ethernet", "eth0"),
+                          lan_con(WIFI, "802-11-wireless", "wlan0")],
+                metrics={"eth0": "100", "wlan0": "100"})
+    assert call(sandbox, "lan-discovery-on").returncode == 0
+    live = sorted(lan_state(sandbox)["live"], key=lambda r: r["dev"])
+    assert live == [{"dev": "eth0", "metric": "100"}, {"dev": "wlan0", "metric": "101"}]
+
+
+def test_lan_discovery_off_removes_only_its_route(sandbox):
+    lan_machine(sandbox, [
+        lan_con(WIRED, "802-3-ethernet", "eth0", routes=[ENDPOINT, "224.0.0.0/24"]),
+        # A saved Wi-Fi network that is not connected now.
+        lan_con(WIFI, "802-11-wireless", "wlan0", active=False, routes=["224.0.0.0/24"]),
+        # A route to the same network through a gateway is someone else's.
+        lan_con("22222222-2222-4333-8444-555555555555", "802-3-ethernet", "eth1",
+                routes=["224.0.0.0/24 192.168.1.1"])],
+        live=[{"dev": "eth0", "metric": "100"}])
+    r = call(sandbox, "lan-discovery-off")
+    assert r.returncode == 0, r.stderr
+    assert routes_of(sandbox, WIRED) == [ENDPOINT]
+    assert routes_of(sandbox, WIFI) == []
+    assert routes_of(sandbox, "22222222-2222-4333-8444-555555555555") == ["224.0.0.0/24 192.168.1.1"]
+    assert lan_state(sandbox)["live"] == []
+    assert call(sandbox, "lan-discovery-off").stdout.strip() == "lan-discovery-off: unchanged"
+    no_bounce(sandbox)
+
+
+@pytest.mark.parametrize("line", [
+    "11111111-2222-4333-8444-555555555555:802-3-ethernet:-eth0",
+    "11111111-2222-4333-8444-555555555555:802-3-ethernet:eth0 metric 1",
+    "11111111-2222-4333-8444-555555555555:802-3-ethernet:eth0:extra",
+    "--help:802-3-ethernet:eth0",
+    "11111111-2222-4333-8444-555555555555:vpn:eth0",
+])
+def test_lan_discovery_checks_what_nmcli_reports(sandbox, line):
+    con = lan_con(WIRED, "802-3-ethernet", "eth0")
+    con["line"] = line
+    lan_machine(sandbox, [con])
+    r = call(sandbox, "lan-discovery-on")
+    assert r.returncode == 1 and "no Ethernet or Wi-Fi connection is active" in r.stderr
+    assert routes_of(sandbox, WIRED) == [] and lan_state(sandbox)["live"] == []
+    assert not [c for c in sandbox.calls("nmcli ") if " modify " in c]
+    assert sandbox.calls("ip ") == []
+
+
+def test_lan_discovery_needs_networkmanager(sandbox):
+    r = call(sandbox, "lan-discovery-on")
+    assert r.returncode == 1 and "not installed" in r.stderr
+    assert call(sandbox, "lan-discovery-off").stdout.strip() == "lan-discovery-off: unchanged"

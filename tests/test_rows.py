@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from conftest import STOCK_HOSTS
+from conftest import STOCK_HOSTS, lan_con, lan_machine, lan_state
 
 PY = sys.executable
 
@@ -402,6 +402,131 @@ def test_localsend_stock_rule_is_optional(box, run):
     assert "localsend-close" not in box.helper_verbs()
     rep = run("row", "localsend", "on")
     assert "localsend-close" in box.helper_verbs()
+
+
+# ------------------------------------------------ LAN discovery over a VPN
+
+WIRED = "11111111-2222-4333-8444-555555555555"
+WIFI = "66666666-7777-4888-9999-aaaaaaaaaaaa"
+TUNNEL = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+# A route of the machine's own, such as a VPN's route to its server through
+# the LAN gateway, which the row must never touch.
+ENDPOINT = "203.0.113.7/32 192.168.1.1"
+
+
+def lan(box, wired_routes=(ENDPOINT,), live=(), wifi=None):
+    """An Ethernet connection on eth0 and a VPN tunnel, both up, and, when
+    wifi is given, a Wi-Fi connection on wlan0 with those routes."""
+    cons = [lan_con(WIRED, "802-3-ethernet", "eth0", routes=wired_routes),
+            lan_con(TUNNEL, "wireguard", "wg0")]
+    if wifi is not None:
+        cons.append(lan_con(WIFI, "802-11-wireless", "wlan0", routes=wifi))
+    lan_machine(box, cons, live)
+
+
+def lan_routes(box, uuid):
+    return next(c["routes"] for c in lan_state(box)["connections"] if c["uuid"] == uuid)
+
+
+def never_bounced(box):
+    """NetworkManager was never asked to bring a connection up or down or to
+    reapply one, which would drop the VPN."""
+    for call in box.calls("nmcli "):
+        assert not any(w in call.split() for w in ("up", "down", "reapply")), call
+
+
+def test_lan_discovery_needs_networkmanager(box, run):
+    (box.bin / "nmcli").unlink()
+    r = rows(run("status"))["lan-discovery"]
+    assert r["status"] == "na" and r["value"] == "no NetworkManager"
+
+
+def test_lan_discovery_needs_a_local_network(box, run):
+    lan_machine(box, [lan_con(TUNNEL, "wireguard", "wg0"),
+                      lan_con("0e0e0e0e-1111-4222-8333-444444444444", "loopback", "lo"),
+                      lan_con("1f1f1f1f-1111-4222-8333-444444444444", "bridge", "virbr0"),
+                      lan_con(WIRED, "802-3-ethernet", "eth0", active=False)])
+    r = rows(run("status"))["lan-discovery"]
+    assert r["status"] == "na" and r["value"] == "no local network"
+
+
+def test_lan_discovery_is_optional_and_adds_only_its_route(box, run):
+    lan(box)
+    rep = run("on")
+    r = rows(rep)["lan-discovery"]
+    assert r["status"] == "off" and r["intended"] is False and r["privileged"] is True
+    assert "lan-discovery-on" not in box.helper_verbs()
+    rep = run("row", "lan-discovery", "on")
+    r = rows(rep)["lan-discovery"]
+    assert r["status"] == "ok" and r["managed"] == "applied"
+    assert lan_routes(box, WIRED) == [ENDPOINT, "224.0.0.0/24"]
+    assert lan_routes(box, TUNNEL) == []
+    # Live, with the metric the device's other routes have.
+    assert lan_state(box)["live"] == [{"dev": "eth0", "metric": "100"}]
+    never_bounced(box)
+    rep = run("row", "lan-discovery", "off")
+    assert rows(rep)["lan-discovery"]["status"] == "off"
+    assert lan_routes(box, WIRED) == [ENDPOINT]
+    assert lan_state(box)["live"] == []
+    never_bounced(box)
+
+
+def test_lan_discovery_set_by_hand_is_adopted(box, run):
+    lan(box, wired_routes=(ENDPOINT, "224.0.0.0/24"), live=[{"dev": "eth0", "metric": "100"}])
+    run("on")
+    rep = run("row", "lan-discovery", "on")
+    r = rows(rep)["lan-discovery"]
+    assert r["status"] == "ok" and r["managed"] == "adopted"
+    assert "lan-discovery-on" not in box.helper_verbs()
+    assert rows(run("status"))["lan-discovery"]["value"] == "on the local network"
+
+
+def test_a_new_wifi_network_without_the_route_has_slipped(box, run):
+    lan(box, wifi=())
+    run("on")
+    run("row", "lan-discovery", "on")
+    assert "224.0.0.0/24" in lan_routes(box, WIFI)
+    # Later, on a Wi-Fi network joined for the first time.
+    st = lan_state(box)
+    st["connections"].append(lan_con("77777777-7777-4888-9999-aaaaaaaaaaaa",
+                                     "802-11-wireless", "wlan1"))
+    (box.root / "lan.json").write_text(json.dumps(st))
+    rep = run("status")
+    r = rows(rep)["lan-discovery"]
+    assert r["status"] == "warn" and r["colour"] == "amber"
+    assert r["value"] == "not set for wlan1" and "lan-discovery" in rep["slipped"]
+    rep = run("on")
+    assert rows(rep)["lan-discovery"]["status"] == "ok"
+    never_bounced(box)
+
+
+def test_one_of_two_connections_without_the_route_is_named(box, run):
+    lan(box, wired_routes=("224.0.0.0/24",), live=[{"dev": "eth0", "metric": "100"}], wifi=())
+    r = rows(run("status"))["lan-discovery"]
+    assert r["inPlace"] is False and r["value"] == "not set for wlan0"
+
+
+def test_a_saved_route_not_yet_live_is_added_on_switching_on(box, run):
+    lan(box, wired_routes=("224.0.0.0/24",))
+    run("on")
+    rep = run("row", "lan-discovery", "on")
+    assert rows(rep)["lan-discovery"]["status"] == "ok"
+    assert "lan-discovery-on" in box.helper_verbs()
+    assert lan_routes(box, WIRED) == ["224.0.0.0/24"]
+    assert lan_state(box)["live"] == [{"dev": "eth0", "metric": "100"}]
+
+
+def test_a_saved_route_not_yet_live_needs_attention(box, run):
+    lan(box, wired_routes=("224.0.0.0/24",))
+    run("on")
+    st = box.state()
+    st["optIn"].append("lan-discovery")
+    st["rows"]["lan-discovery"] = {"how": "applied", "at": 1}
+    box.write(box.state_file, json.dumps(st))
+    rep = run("status")
+    r = rows(rep)["lan-discovery"]
+    assert r["status"] == "warn" and "not in effect yet" in r["why"]
+    assert "lan-discovery" in rep["attention"]
 
 
 # -------------------------------------------------------------- web apps

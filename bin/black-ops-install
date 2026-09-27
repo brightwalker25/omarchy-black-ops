@@ -42,6 +42,7 @@ VERBS=(
   listen-on listen-off listen-purge
   bt-privacy-on bt-privacy-off
   avahi-mask avahi-unmask
+  lan-discovery-on lan-discovery-off
 )
 
 SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -168,6 +169,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
   echo "  and /etc/bluetooth/main.conf"
   echo "  the Avahi daemon, if it was masked: systemctl unmask avahi-daemon.socket avahi-daemon.service"
   echo "  Omarchy's LocalSend rules, if they were closed: ufw allow 53317/tcp and 53317/udp"
+  echo "  the LAN discovery route, if it was added, for each Ethernet and Wi-Fi connection:"
+  echo "    nmcli connection modify CONNECTION -ipv4.routes 224.0.0.0/24"
+  echo "    and, while it is connected, ip route del 224.0.0.0/24 dev DEVICE"
   echo "Lines just above that block in /etc/hosts, outside it, are not Black Ops's."
   echo
   echo "The software watch's user units and its state in ~/.local/state/black-ops"

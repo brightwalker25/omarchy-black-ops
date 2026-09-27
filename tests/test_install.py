@@ -102,3 +102,20 @@ def test_uninstall_removes_the_pacman_hook_before_the_script_it_runs():
     assert hook < out.index("rm -rf /usr/local/lib/omarchy-black-ops")
     assert "rm -rf /var/lib/omarchy-black-ops" in out
     assert "rm -rf /etc/omarchy-black-ops" in out
+
+
+def test_the_lan_discovery_verbs_are_exact_commands_in_the_rule():
+    r = installer("--print-sudoers", "alice")
+    _, commands = rule_commands(r.stdout)
+    for verb in ("lan-discovery-on", "lan-discovery-off"):
+        assert f"{HELPER} {verb}" in commands
+    # They take nothing after the verb, so the rule needs no wildcard for them.
+    assert all(re.fullmatch(re.escape(HELPER) + r" [a-z0-9-]+", c) for c in commands)
+
+
+def test_uninstall_says_how_to_take_the_lan_discovery_route_out():
+    r = installer("--uninstall", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "-ipv4.routes 224.0.0.0/24" in r.stdout
+    assert "ip route del 224.0.0.0/24" in r.stdout
+    assert "connection up" not in r.stdout and "reapply" not in r.stdout

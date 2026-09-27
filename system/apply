@@ -65,6 +65,8 @@ VERBS = (
     "bt-privacy-off",
     "avahi-mask",
     "avahi-unmask",
+    "lan-discovery-on",
+    "lan-discovery-off",
 )
 
 # Where things live. These are constants rather than settings, because a root
@@ -92,6 +94,7 @@ AVAHI_UNIT_FILE = "/usr/lib/systemd/system/avahi-daemon.service"
 RESOLVECTL = "/usr/bin/resolvectl"
 SYSTEMCTL = "/usr/bin/systemctl"
 NMCLI = "/usr/bin/nmcli"
+IP = "/usr/bin/ip"
 UFW = "/usr/bin/ufw"
 CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 LISTEN_SERVICE = "omarchy-black-ops-listen.service"
@@ -215,6 +218,18 @@ AVAHI_UNITS = ("avahi-daemon.socket", "avahi-daemon.service")
 # the LocalSend verbs delete or add again. A rule you wrote yourself, such as
 # one limited to your own network, is a different rule and is left alone.
 LOCALSEND_RULES = ("53317/tcp", "53317/udp")
+
+# The LAN discovery verbs keep link-local multicast on the local network
+# while a VPN routes everything else through its tunnel. The route is the one
+# thing they add or remove, on Ethernet and Wi-Fi connections only, and it is
+# never a path to anywhere else: routers do not forward 224.0.0.0/24. Every
+# UUID and device name nmcli reports is checked against these patterns before
+# it is passed to another command. bin/black-ops holds the same values.
+LAN_ROUTE = "224.0.0.0/24"
+LAN_TYPES = ("802-3-ethernet", "802-11-wireless")
+LAN_ROUTE_ENTRY = re.compile(r"224\.0\.0\.0/24(?: 0\.0\.0\.0)?(?: [0-9]{1,10})?")
+NM_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+IFNAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@-]{0,14}")
 
 O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -784,6 +799,130 @@ def localsend(open_it):
     return "changed"
 
 
+# ---------------------------------------------------------- LAN discovery
+
+def output(cmd):
+    """Run a fixed command as run() does, and return what it printed, or None
+    when it failed."""
+    try:
+        r = subprocess.run(cmd, env=CLEAN_ENV, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def lan_profiles(active):
+    """(uuid, device) for each Ethernet and Wi-Fi connection NetworkManager
+    has: the active ones with their device, or every saved one, whose device
+    is "" when it is not active. A line that is not exactly what nmcli
+    prints for such a connection is skipped, so nothing it reports reaches
+    another command unchecked."""
+    cmd = [NMCLI, "-t", "-f", "UUID,TYPE,DEVICE", "connection", "show"]
+    out = output(cmd + ["--active"] if active else cmd)
+    if out is None:
+        raise HelperError("nmcli could not list the connections")
+    found = []
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) != 3 or parts[1] not in LAN_TYPES or not NM_UUID.fullmatch(parts[0]):
+            continue
+        if IFNAME.fullmatch(parts[2]):
+            found.append((parts[0], parts[2]))
+        elif not active and parts[2] == "":
+            found.append((parts[0], ""))
+    return found
+
+
+def profile_lan_routes(uuid):
+    """The connection's ipv4.routes entries that are the LAN discovery route,
+    exactly as nmcli prints them. Every other entry is left alone."""
+    out = output([NMCLI, "-g", "ipv4.routes", "connection", "show", uuid])
+    if out is None:
+        raise HelperError("nmcli could not read a connection's routes")
+    return [e.strip() for e in out.split(",") if LAN_ROUTE_ENTRY.fullmatch(e.strip())]
+
+
+def live_lan_routes(device=None):
+    """{metric: device} for the 224.0.0.0/24 routes in the main table, or
+    only those through `device`."""
+    out = output([IP, "-4", "route", "show", "exact", LAN_ROUTE, "table", "main"])
+    if out is None:
+        raise HelperError("ip could not read the routing table")
+    found = {}
+    for line in out.splitlines():
+        dev = re.search(r" dev (\S+)", line)
+        metric = re.search(r" metric ([0-9]{1,10})(?: |$)", line)
+        if not line.startswith(LAN_ROUTE + " ") or " via " in line or not dev:
+            continue
+        if device is None or dev.group(1) == device:
+            found[metric.group(1) if metric else "0"] = dev.group(1)
+    return found
+
+
+def device_metric(device):
+    """The metric NetworkManager gives the device's other routes, so that the
+    live route sits where NetworkManager itself puts it when the connection
+    next comes up, or "0" when the device has no route yet."""
+    out = output([IP, "-4", "route", "show", "table", "main", "dev", device]) or ""
+    m = re.search(r" metric ([0-9]{1,10})(?: |$)", out, re.M)
+    return m.group(1) if m else "0"
+
+
+def lan_discovery_on():
+    """Add the route to each active Ethernet and Wi-Fi connection's profile,
+    if it is not there, and to the running routing table through its device.
+    NetworkManager is never asked to bring a connection up, down or reapply
+    it, since that would drop the VPN; the route is added live with ip
+    instead, and NetworkManager adds it from the profile when the connection
+    next comes up."""
+    if not os.path.exists(NMCLI):
+        raise HelperError("NetworkManager is not installed")
+    lans = lan_profiles(active=True)
+    if not lans:
+        raise HelperError("no Ethernet or Wi-Fi connection is active")
+    changed = False
+    for uuid, device in lans:
+        if not profile_lan_routes(uuid):
+            if not run([NMCLI, "connection", "modify", uuid, "+ipv4.routes", LAN_ROUTE]):
+                raise HelperError(f"nmcli could not add the route for {device}")
+            changed = True
+        if live_lan_routes(device):
+            continue
+        # A route is keyed by its metric, not its device, so one already
+        # used by another device's route is stepped past, never replaced.
+        taken = live_lan_routes()
+        metric = int(device_metric(device))
+        while str(metric) in taken:
+            metric += 1
+        if not run([IP, "-4", "route", "replace", LAN_ROUTE, "dev", device, "table", "main",
+                    "metric", str(metric)]):
+            raise HelperError(f"ip could not add the route through {device}")
+        changed = True
+    return "changed" if changed else "unchanged"
+
+
+def lan_discovery_off():
+    """Take the route out of every saved Ethernet and Wi-Fi connection and
+    out of the running routing table for the active ones. Only entries for
+    224.0.0.0/24 without a next hop are removed; every other route stays."""
+    if not os.path.exists(NMCLI):
+        return "unchanged"
+    changed = False
+    for uuid, _ in lan_profiles(active=False):
+        for entry in profile_lan_routes(uuid):
+            if not run([NMCLI, "connection", "modify", uuid, "-ipv4.routes", entry]):
+                raise HelperError("nmcli could not remove the route from a connection")
+            changed = True
+    for _, device in lan_profiles(active=True):
+        for metric in live_lan_routes(device):
+            if not run([IP, "-4", "route", "del", LAN_ROUTE, "dev", device, "table", "main",
+                        "metric", metric]):
+                raise HelperError(f"ip could not remove the route through {device}")
+            changed = True
+    return "changed" if changed else "unchanged"
+
+
 # ------------------------------------------------------------- listen mode
 
 def listen_active():
@@ -954,6 +1093,10 @@ def dispatch(verb):
         return avahi_mask()
     if verb == "avahi-unmask":
         return avahi_unmask()
+    if verb == "lan-discovery-on":
+        return lan_discovery_on()
+    if verb == "lan-discovery-off":
+        return lan_discovery_off()
     raise HelperError("unknown verb")
 
 

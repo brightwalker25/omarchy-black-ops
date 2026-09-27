@@ -12,8 +12,8 @@ DATADOG = "http-intake.logs.us5.datadoghq.com"
 ROW_IDS = ["weather", "agents", "dns", "claude", "hosts"]
 ALL_ROWS = ROW_IDS + ["bluetooth", "identity", "chromium", "connectivity", "avahi", "webapps",
                       "dev-telemetry", "nvim-checker", "opt-out-env", "update-badge", "herdr",
-                      "localsend", "debuginfod", "crash-watch", "fwupd-p2p", "avahi-daemon",
-                      "bt-privacy", "claude-usage", "watch"]
+                      "localsend", "lan-discovery", "debuginfod", "crash-watch", "fwupd-p2p",
+                      "avahi-daemon", "bt-privacy", "claude-usage", "watch"]
 # Optional rows that are off, never not applicable, on any machine. Listen
 # mode is not applicable until the installer has put its service in place.
 # The Claude usage check is off rather than not applicable wherever the

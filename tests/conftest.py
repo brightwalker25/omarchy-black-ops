@@ -173,6 +173,97 @@ with open(os.path.join(root, "calls.log"), "a") as fh:
 sys.exit(0)
 """
 
+# NetworkManager and the main routing table, for the LAN discovery row and
+# its helper verbs, as a small model kept in lan.json in the sandbox. nmcli
+# answers only the calls Black Ops makes and fails any other, such as
+# bringing a connection up, down or reapplying it; the calls log shows them.
+STUB_NM_LAN = """\
+import json, os, sys
+root = os.environ["BLACK_OPS_FAKE_ROOT"]
+with open(os.path.join(root, "calls.log"), "a") as fh:
+    fh.write("nmcli " + " ".join(sys.argv[1:]) + "\\n")
+path = os.path.join(root, "lan.json")
+st = json.load(open(path))
+cons = st["connections"]
+args = sys.argv[1:]
+if args[:5] == ["-t", "-f", "UUID,TYPE,DEVICE", "connection", "show"]:
+    active = args[5:] == ["--active"]
+    for c in cons:
+        if c["active"] or not active:
+            print(c.get("line") or ":".join((c["uuid"], c["type"], c["device"] if c["active"] else "")))
+elif args[:4] == ["-g", "ipv4.routes", "connection", "show"] and len(args) == 5:
+    c = next((c for c in cons if c["uuid"] == args[4]), None)
+    if c is None:
+        sys.exit(10)
+    print(", ".join(c["routes"]))
+elif args[:2] == ["connection", "modify"] and len(args) == 5:
+    c = next(c for c in cons if c["uuid"] == args[2])
+    if args[3] == "+ipv4.routes":
+        c["routes"].append(args[4])
+    elif args[3] == "-ipv4.routes" and args[4] in c["routes"]:
+        c["routes"].remove(args[4])
+    else:
+        sys.exit(2)
+else:
+    sys.exit(2)
+json.dump(st, open(path, "w"))
+"""
+
+# ip, over the same model. A route in the main table is keyed by its
+# destination and metric, as in the kernel, so replacing one with the same
+# metric through another device takes that device's route away.
+STUB_IP = """\
+import json, os, sys
+root = os.environ["BLACK_OPS_FAKE_ROOT"]
+with open(os.path.join(root, "calls.log"), "a") as fh:
+    fh.write("ip " + " ".join(sys.argv[1:]) + "\\n")
+path = os.path.join(root, "lan.json")
+st = json.load(open(path))
+args = sys.argv[1:]
+if args == ["-4", "route", "show", "exact", "224.0.0.0/24", "table", "main"]:
+    for r in st["live"]:
+        print("224.0.0.0/24 dev " + r["dev"] + " scope link metric " + r["metric"] + " ")
+elif args[:6] == ["-4", "route", "show", "table", "main", "dev"] and len(args) == 7:
+    m = st["metrics"].get(args[6])
+    if m:
+        print("default via 192.168.1.1 proto dhcp src 192.168.1.20 metric " + m + " ")
+elif args[:2] == ["-4", "route"] and args[2] in ("replace", "del") and len(args) == 10 \\
+        and args[3] == "224.0.0.0/24" and args[4::2] == ["dev", "table", "metric"]:
+    dev, table, metric = args[5], args[7], args[9]
+    if table != "main":
+        sys.exit(2)
+    if args[2] == "replace":
+        st["live"] = [r for r in st["live"] if r["metric"] != metric] + [{"dev": dev, "metric": metric}]
+    else:
+        keep = [r for r in st["live"] if (r["dev"], r["metric"]) != (dev, metric)]
+        if len(keep) == len(st["live"]):
+            sys.exit(2)
+        st["live"] = keep
+else:
+    sys.exit(2)
+json.dump(st, open(path, "w"))
+"""
+
+
+def lan_con(uuid, kind, device, active=True, routes=()):
+    """One NetworkManager connection in the model."""
+    return {"uuid": uuid, "type": kind, "device": device, "active": active,
+            "routes": list(routes)}
+
+
+def lan_machine(sandbox, connections, live=(), metrics=None):
+    """Stub nmcli and ip over the given connections and live 224.0.0.0/24
+    routes, each {"dev": ..., "metric": ...}."""
+    for name, text in (("nmcli", STUB_NM_LAN), ("ip", STUB_IP)):
+        sandbox.stub(name, "#!" + sys.executable + "\n" + text)
+    doc = {"connections": list(connections), "live": list(live),
+           "metrics": metrics or {"eth0": "100", "wlan0": "600"}}
+    (sandbox.root / "lan.json").write_text(json.dumps(doc))
+
+
+def lan_state(sandbox):
+    return json.loads((sandbox.root / "lan.json").read_text())
+
 
 class Sandbox:
     def __init__(self, root):

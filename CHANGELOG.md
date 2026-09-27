@@ -6,6 +6,25 @@ Notable changes to the Black Ops plugin. Versions follow
 
 ## [Unreleased]
 
+The helper has new verbs, so run the installer once more after upgrading.
+The new row is optional and stays off until switched on by itself.
+
+### Added
+
+- An optional LAN discovery row, off until switched on by itself, for
+  machines that use a VPN. A VPN that sends everything through its tunnel
+  also takes link-local multicast, so LocalSend and similar tools on the
+  local network can no longer find this machine. The row adds the route
+  `224.0.0.0/24` to the NetworkManager profile of each active Ethernet and
+  Wi-Fi connection, and to the running routing table, without bringing any
+  connection down, so the VPN stays up. It has no cost: routers never
+  forward these addresses, so nothing else goes around the VPN. A route
+  already there is adopted, and a Wi-Fi network joined for the first time
+  reads as slipped until the row is switched on again.
+- Helper verbs `lan-discovery-on` and `lan-discovery-off`. Like every other
+  verb, they take no argument, so the sudoers rule stays a list of exact
+  commands.
+
 ### Changed
 
 - The weather location is now moved to the centre of a square about 1.5

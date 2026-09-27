@@ -135,6 +135,9 @@ Optional, off until switched on one by one:
 - herdr's update check, by sinking `herdr.dev`.
 - The LocalSend port, which Omarchy opens to every network. A rule of your
   own, such as one for your local network only, is left alone.
+- LAN discovery over a VPN. This one protects nothing and costs nothing: it
+  keeps link-local multicast on the local network while a VPN is
+  connected, so LocalSend and similar tools can still find this machine.
 - Debug symbol downloads from `debuginfod.archlinux.org`, turned off for the
   session through uwsm. Omarchy's crash diagnosis still sets its own server
   when you ask it for one.
@@ -224,6 +227,7 @@ omarchy-shell brightwalker25.black-ops switchOff
 | Update badge (optional) | Takes the badge off the bar | no |
 | herdr update check (optional) | Sinks `herdr.dev` in /etc/hosts | yes |
 | LocalSend firewall port (optional) | Deletes Omarchy's two `53317` rules from ufw | yes |
+| LAN discovery over a VPN (optional) | Adds the route `224.0.0.0/24` to each Ethernet and Wi-Fi connection | yes |
 | Debug symbol downloads (optional) | `~/.config/uwsm/env.d/90-black-ops-debuginfod` with an empty `DEBUGINFOD_URLS` | no |
 | Crash diagnosis offer (optional) | `systemctl --user mask omarchy-crash-watch` | no |
 | Firmware peer sharing (optional) | `P2pPolicy=nothing` in `/etc/fwupd/fwupd.conf`, marked | yes |
@@ -336,6 +340,32 @@ and unsets only the variables it set. Variables already set by hand in the
 session are adopted. Without uwsm, which reads the file, the row is not
 applicable.
 
+**LAN discovery over a VPN.** There is no cost, and nothing changes while
+no VPN is connected. A VPN that sends everything through its tunnel with a
+routing table of its own also takes link-local multicast, so
+`ip route get 224.0.0.167` answers with the tunnel. LocalSend finds devices
+by multicasting to 224.0.0.167, so with the VPN up this machine disappears
+from LocalSend on your phone and your other machines, and cannot announce
+itself; files sent to a known address still arrive. Switching this on adds
+the route `224.0.0.0/24` through the LAN interface to the NetworkManager
+profile of each active Ethernet and Wi-Fi connection, with
+`nmcli connection modify`, and to the running routing table with `ip
+route replace`, since the profile's routes are only read when a connection
+comes up. A route in the main table wins because the VPN's rule that sends
+traffic to the main table first ignores only default routes. It keeps
+link-local multicast on the local network, mDNS included, as it would be
+without the VPN. It routes nothing else around the VPN: routers never
+forward `224.0.0.0/24`, so nothing leaves the local network and the tunnel
+is not weakened. NetworkManager is never asked to bring a connection up,
+down or reapply it, since that would drop the VPN, and every other route in
+a profile is left alone. A route there already is adopted. The row reads
+the profiles of the active connections, so a Wi-Fi network you join for the
+first time turns it amber until it is switched on again; a route that is
+saved but not yet in effect needs attention until then as well. Switching
+off takes the route out of every saved Ethernet and Wi-Fi connection and
+out of the running table. Without NetworkManager or an active Ethernet or
+Wi-Fi connection, the row is not applicable.
+
 **Debug symbol downloads.** The value is set through uwsm rather than
 `~/.config/environment.d`, because uwsm passes the login shell's
 environment to the session after environment.d has been read, and Arch's
@@ -373,6 +403,8 @@ applied or adopted:
   `main.conf` are taken out and whatever they had commented out is put back,
   and Bluetooth is restarted;
 - the Avahi daemon is unmasked and started again;
+- the LAN discovery route is taken out of every saved Ethernet and Wi-Fi
+  connection and out of the running routing table;
 - the Agents panel has all three providers enabled again;
 - the two Claude Code keys are removed;
 - the Bluetooth login service goes and the adapter gets its own name back;
@@ -563,10 +595,14 @@ fwupd-p2p-on      fwupd-p2p-off
 listen-on         listen-off        listen-purge
 bt-privacy-on     bt-privacy-off
 avahi-mask        avahi-unmask
+lan-discovery-on  lan-discovery-off
 ```
 
 `version` prints the helper's version and changes nothing; the installer uses
-it to confirm what it installed. No verb takes a path or any other text. The
+it to confirm what it installed. No verb takes a path or any other text, so
+the rule is a list of exact commands with no wildcard. The LAN discovery
+verbs find the active connections and their devices themselves, through
+nmcli, and check each UUID and device name before using it. The
 helper refuses to run unless it is root and unless its own file and every
 folder above it are owned by root and writable by nobody else. It opens every
 folder one component at a time without following links, writes each file
@@ -643,8 +679,8 @@ bin/black-ops row claude off   # one row
 Row ids: `weather`, `agents`, `dns`, `claude`, `hosts`, `bluetooth`,
 `identity`, `chromium`, `connectivity`, `avahi`, `webapps`, `dev-telemetry`,
 `nvim-checker`, `opt-out-env`, and the optional `update-badge`, `herdr`,
-`localsend`, `debuginfod`, `crash-watch`, `fwupd-p2p`, `avahi-daemon`,
-`bt-privacy` and `claude-usage`. `bin/black-ops pair` opens the Bluetooth
+`localsend`, `lan-discovery`, `debuginfod`, `crash-watch`, `fwupd-p2p`,
+`avahi-daemon`, `bt-privacy` and `claude-usage`. `bin/black-ops pair` opens the Bluetooth
 pair window.
 
 ## Adding a protection
@@ -689,6 +725,8 @@ the sandbox. The tests refuse to run as root.
   trusts `main.conf`.
 - The hosts block and the helper refuse to work through a symbolic link, so a
   machine whose `/etc/hosts` is a link cannot use the hosts row.
+- The LAN discovery row covers IPv4 link-local multicast, which LocalSend
+  uses. IPv6 link-local multicast is not routed by it.
 
 ## Written with AI help
 
