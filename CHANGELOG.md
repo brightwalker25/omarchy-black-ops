@@ -6,10 +6,40 @@ Notable changes to the Black Ops plugin. Versions follow
 
 ## [Unreleased]
 
-The helper has new verbs, so run the installer once more after upgrading.
-The new row is optional and stays off until switched on by itself.
+The helper has new verbs and blocks more hosts, so run the installer once
+more after upgrading, then use "Apply what is new" in the panel. The LAN
+discovery row is optional and stays off until switched on by itself.
 
 ### Added
+
+- When the root helper is missing or out of date, the panel and the text
+  output now give the exact command to run, with the installer's real path
+  on that machine and the home folder written as `~`, such as
+  `sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install`,
+  and say to switch Black Ops on again afterwards. The panel has a Copy
+  command button that puts it on the clipboard with `wl-copy`; it runs
+  nothing itself. The status JSON carries the command as `helperCommand`.
+
+- A Proton VPN crash reports row, `proton-crash`, that sets
+  `anonymous_crash_reports` to false in `~/.config/Proton/VPN/settings.json`
+  and changes nothing else in the file. Switching off puts back the value it
+  had, or takes the key out again if Black Ops added it. Crash reports that
+  were already off are adopted and left off on the way off, because turning
+  them off was the user's choice in the app. Without that file, the row is
+  not applicable.
+- Eleven hosts in the hosts block beside Claude Code's Datadog intake:
+  Claude Code's Sentry crash reports (`o1158394.ingest.us.sentry.io`),
+  Codex's Sentry crash reports (`o33249.ingest.us.sentry.io`), 1Password's
+  telemetry and Sentry (`telemetry.1passwordservices.com` and
+  `core-sentry.1passwordservices.com`), Brave's daily usage ping and P3A
+  analytics (`usage-ping.brave.com` and `star-randsrv.bsg.brave.com`), the
+  Mozilla telemetry that Firefox-based browsers such as Zen send
+  (`incoming.telemetry.mozilla.org`), and Google Analytics, which Obsidian
+  and OnlyOffice carry (`google-analytics.com`, `www.google-analytics.com`,
+  `ssl.google-analytics.com` and `region1.google-analytics.com`). Pages
+  that use Google Analytics stop reporting your visits to it.
+- `ORT_DISABLE_TELEMETRY=1` in the opt-out variables, so onnxruntime, which
+  local AI tools bring in, stops sending Microsoft telemetry.
 
 - An optional LAN discovery row, off until switched on by itself, for
   machines that use a VPN. A VPN that sends everything through its tunnel
@@ -27,6 +57,24 @@ The new row is optional and stays off until switched on by itself.
 
 ### Changed
 
+- When the root helper is out of date and the rows waiting to be applied need
+  root, the headline now says "On, but the root helper needs reinstalling"
+  rather than naming those rows, since running the installer again is what
+  applies them.
+
+- Black Ops no longer covers only what stock Omarchy ships. The rule is now
+  that unless telemetry is absolutely essential for a program to work, it is
+  barred, and that applies to apps you install yourself too. This reverses
+  the scope set in 0.2.0. The hosts Nightloom blocks for itself stay
+  Nightloom's.
+- The hosts row is now called "Telemetry hosts". It applies on every
+  machine, rather than reading as not applicable until Claude Code is set
+  up, since the programs it covers can be installed at any time. A block
+  written by an earlier version, with fewer hosts in it, reads as not
+  applied yet rather than as slipped, and switching on adds the rest.
+  Switching herdr's update check on or off leaves such a block as it is.
+- An opt-out variables file written by an earlier version reads as not
+  applied yet rather than as slipped, and switching off removes it as well.
 - The weather location is now moved to the centre of a square about 1.5
   miles (2.4 km) across, the same width east to west as north to south,
   instead of rounded to two decimal places (about 1.1 km north to south and

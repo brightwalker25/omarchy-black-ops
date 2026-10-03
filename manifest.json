@@ -5,7 +5,7 @@
   "version": "0.4.0",
   "author": "brightwalker25",
   "license": "MIT",
-  "description": "One switch for privacy protections in stock Omarchy, with a watchdog that shows when one has slipped. It sends nothing anywhere",
+  "description": "One switch for privacy protections in Omarchy and the apps you install, with a watchdog that shows when one has slipped. It sends nothing anywhere",
   "kinds": [
     "bar-widget"
   ],
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Black Ops",
-    "description": "A scope in the bar that switches a few privacy settings in stock Omarchy on or off together, and turns amber when an update undoes one",
+    "description": "A scope in the bar that switches a few privacy settings in Omarchy and the apps you install on or off together, and turns amber when an update undoes one",
     "category": "System",
     "aliases": [
       "black-ops",

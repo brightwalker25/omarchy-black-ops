@@ -83,6 +83,23 @@ HOSTS_01 = STOCK_HOSTS + "\n" + BLOCK_01 + "# END black-ops\n"
 HOSTS_01_OLLAMA = (STOCK_HOSTS + "\n" + BLOCK_01 +
                    "0.0.0.0 ollama.com\n:: ollama.com\n# END black-ops\n")
 
+DATADOG = "http-intake.logs.us5.datadoghq.com"
+# Every host the telemetry block sinks now, as the helper lists them.
+TELEMETRY_HOSTS = load_module("black_ops_apply_hosts", REPO / "system" / "apply").TELEMETRY_HOSTS
+
+
+def hosts_block(hosts):
+    """The black-ops block in /etc/hosts as the helper writes it for `hosts`."""
+    return ("# BEGIN black-ops\n"
+            "# Managed by the Black Ops bar plugin. Switch it off there rather than editing here.\n"
+            + "".join(f"0.0.0.0 {h}\n:: {h}\n" for h in hosts) + "# END black-ops\n")
+
+
+# The block as Black Ops 0.2.0 to 0.4.0 wrote it, with the Datadog host alone,
+# and the block as this version writes it.
+BLOCK_02 = hosts_block((DATADOG,))
+BLOCK_NOW = hosts_block(TELEMETRY_HOSTS)
+
 
 def state_01(ollama_block=False):
     """state.json as Black Ops 0.1 wrote it, switched on with every row

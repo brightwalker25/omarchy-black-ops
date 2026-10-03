@@ -4,16 +4,18 @@ import json
 import os
 import socket
 
-from conftest import HAND_HOSTS, STOCK_HOSTS
+from conftest import BLOCK_NOW, DATADOG, HAND_HOSTS, STOCK_HOSTS, TELEMETRY_HOSTS
 
-DATADOG = "http-intake.logs.us5.datadoghq.com"
 # The rows every machine in these tests has. The others have nothing to
 # protect in the sandbox unless a test sets it up, and read as not applicable.
 ROW_IDS = ["weather", "agents", "dns", "claude", "hosts"]
+# The stock and hand-made machines also have the Proton VPN app set up, so
+# its crash report row applies to them as well.
+PROTON = "proton-crash"
 ALL_ROWS = ROW_IDS + ["bluetooth", "identity", "chromium", "connectivity", "avahi", "webapps",
-                      "dev-telemetry", "nvim-checker", "opt-out-env", "update-badge", "herdr",
-                      "localsend", "lan-discovery", "debuginfod", "crash-watch", "fwupd-p2p",
-                      "avahi-daemon", "bt-privacy", "claude-usage", "watch"]
+                      "dev-telemetry", "nvim-checker", "opt-out-env", PROTON, "update-badge",
+                      "herdr", "localsend", "lan-discovery", "debuginfod", "crash-watch",
+                      "fwupd-p2p", "avahi-daemon", "bt-privacy", "claude-usage", "watch"]
 # Optional rows that are off, never not applicable, on any machine. Listen
 # mode is not applicable until the installer has put its service in place.
 # The Claude usage check is off rather than not applicable wherever the
@@ -31,12 +33,14 @@ def hand_hosts_without_datadog():
 
 # ---------------------------------------------------------------- adoption
 
-def test_the_rows_are_the_stock_omarchy_ones(run, sandbox):
+def test_the_rows_are_the_expected_ones(run, sandbox):
     sandbox.stock_machine()
     rep = run("status")
     # Listen mode adds its optional row at the end.
     assert [r["id"] for r in rep["rows"] if r["id"] != "listen"] == ALL_ROWS
-    assert all(r["status"] == "na" for r in rep["rows"] if r["id"] not in ROW_IDS + list(NEVER_NA))
+    assert rows(rep)[PROTON]["status"] != "na"
+    assert all(r["status"] == "na" for r in rep["rows"]
+               if r["id"] not in ROW_IDS + [PROTON] + list(NEVER_NA))
     assert all(r["status"] == "off" for r in rep["rows"] if r["id"] in NEVER_NA)
 
 
@@ -47,10 +51,14 @@ def test_status_reads_a_hand_made_machine_without_writing(sandbox, run):
     r = rows(rep)
     assert rep["master"] is False and rep["overall"] == "off"
     # Off never claims a stock machine when protections are in place by hand.
-    assert rep["headline"] == "Off, not managing. 5 protections are in place by hand"
+    # The hosts row is not among them: the Datadog host alone is blocked by
+    # hand, of the hosts Black Ops now blocks, and the VPN app still sends
+    # its crash reports.
+    assert rep["headline"] == "Off, not managing. 4 protections are in place by hand"
     for row_id in ROW_IDS:
-        assert r[row_id]["inPlace"], row_id
-    assert r["hosts"]["value"] == "blocked by hand"
+        assert r[row_id]["inPlace"] == (row_id != "hosts"), row_id
+    assert r["hosts"]["value"] == f"1 of {len(TELEMETRY_HOSTS)} blocked"
+    assert not r[PROTON]["inPlace"]
     assert sandbox.snapshot() == before
     assert not sandbox.state_file.parent.exists()
     assert sandbox.helper_verbs() == []
@@ -61,27 +69,43 @@ def test_on_adopts_what_is_already_in_place(sandbox, run):
     before = sandbox.snapshot()
     rep = run("on")
     # The only privileged call is the one that moves the hand-written hosts
-    # lines into the marked block. Nothing already in place is applied again.
+    # line into the marked block and adds the hosts it lacks. Nothing
+    # already in place is applied again. The hosts block and the VPN app's
+    # crash reports were not in place, so they are applied.
     assert sandbox.helper_verbs() == ["hosts-on"]
     assert rep["overall"] == "ok", rep
     how = {k: v["how"] for k, v in sandbox.state()["rows"].items()}
-    assert how == {k: "adopted" for k in ROW_IDS}
+    assert how == {**{k: "adopted" for k in ROW_IDS if k != "hosts"},
+                   "hosts": "applied", PROTON: "applied"}
     after = sandbox.snapshot()
     changed = {p for p in before if before[p] != after.get(p)}
-    assert changed == {str(sandbox.hosts)}
+    assert changed == {str(sandbox.hosts), str(sandbox.proton)}
+
+
+def test_every_telemetry_host_blocked_by_hand_is_adopted(sandbox, run):
+    sandbox.hand_machine()
+    sandbox.write(sandbox.hosts, HAND_HOSTS + "".join(
+        f"0.0.0.0 {h}\n:: {h}\n" for h in TELEMETRY_HOSTS if h != DATADOG))
+    r = rows(run("status"))["hosts"]
+    assert r["inPlace"] and r["value"] == "blocked by hand"
+    run("on")
+    assert sandbox.state()["rows"]["hosts"]["how"] == "adopted"
+    # The hand-written lines move into the block, and only the Microsoft and
+    # Sentry lines Black Ops does not manage stay outside it.
+    assert sandbox.hosts.read_text() == hand_hosts_without_datadog() + "\n" + BLOCK_NOW
+    assert rows(run("status"))["hosts"]["value"] == "blocked"
 
 
 def test_hand_written_lines_move_into_the_block(sandbox, run):
     sandbox.hand_machine()
     run("on")
     text = sandbox.hosts.read_text()
-    # The Datadog pair moves into the block. The Microsoft and Sentry lines
-    # are not Black Ops's, and stay where they were, with their comments.
+    # The Datadog pair moves into the block, beside the other telemetry
+    # hosts. The Microsoft and Sentry lines are not Black Ops's, and stay
+    # where they were, with their comments.
     assert text.startswith(hand_hosts_without_datadog())
     body = text[len(hand_hosts_without_datadog()):]
-    assert body == ("\n# BEGIN black-ops\n"
-                    "# Managed by the Black Ops bar plugin. Switch it off there rather than editing here.\n"
-                    f"0.0.0.0 {DATADOG}\n:: {DATADOG}\n# END black-ops\n")
+    assert body == "\n" + BLOCK_NOW
     assert text.count(DATADOG) == 2
     assert rows(run("status"))["hosts"]["value"] == "blocked"
 
@@ -104,15 +128,17 @@ def test_on_is_idempotent(sandbox, run):
 
 def test_on_then_off_on_a_stock_machine(sandbox, run):
     sandbox.stock_machine()
-    untouched = [sandbox.proton, sandbox.onnx / "device.id", sandbox.webui_db]
+    untouched = [sandbox.onnx / "device.id", sandbox.webui_db]
     untouched_before = [p.read_bytes() for p in untouched]
+    proton_before = sandbox.proton.read_bytes()
     claude_before = sandbox.claude.read_bytes()
     shell_before = sandbox.shell_json.read_bytes()
     rep = run("on")
     assert rep["overall"] == "ok", rep
     assert sorted(sandbox.helper_verbs()) == ["dns-on", "hosts-on"]
-    assert f"0.0.0.0 {DATADOG}\n" in sandbox.hosts.read_text()
+    assert sandbox.hosts.read_text() == STOCK_HOSTS + "\n" + BLOCK_NOW
     assert "FallbackDNS=\n" in sandbox.dns_dropin.read_text()
+    assert json.loads(sandbox.proton.read_text())["anonymous_crash_reports"] is False
     w = json.loads(sandbox.weather.read_text())
     assert (w["latitude"], w["longitude"], w["name"]) == (48.8568, 2.3071, "Somewhere")
 
@@ -133,6 +159,8 @@ def test_on_then_off_on_a_stock_machine(sandbox, run):
     assert (w["latitude"], w["longitude"]) == (48.8568, 2.3071)
     assert "does not restore" in rows(rep)["weather"]["detail"]
     assert sandbox.state()["rows"] == {}
+    # The VPN app's settings are back byte for byte.
+    assert sandbox.proton.read_bytes() == proton_before
     # Apps Black Ops does not manage were never touched.
     assert [p.read_bytes() for p in untouched] == untouched_before
 
@@ -253,23 +281,26 @@ def test_without_the_helper_the_privileged_rows_say_so(sandbox, run):
 
 def test_a_bare_machine_is_skipped_cleanly(sandbox, run):
     """Stock Omarchy before any of these files exist: no weather location
-    chosen yet, no Agents widget on the bar, Claude Code never started."""
+    chosen yet, no Agents widget on the bar, Claude Code never started. The
+    telemetry hosts are blocked all the same, since they cover programs that
+    may be installed at any time."""
     sandbox.write(sandbox.hosts, STOCK_HOSTS)
     rep = run("on")
     r = rows(rep)
-    for row_id in ("weather", "agents", "claude", "hosts"):
+    for row_id in ("weather", "agents", "claude", PROTON):
         assert r[row_id]["status"] == "na", row_id
         assert r[row_id]["error"] == "", row_id
         assert r[row_id]["switchable"] is False, row_id
-    assert r["dns"]["status"] == "ok"
+    assert r["dns"]["status"] == "ok" and r["hosts"]["status"] == "ok"
     assert rep["overall"] == "ok", rep
-    assert sandbox.helper_verbs() == ["dns-on"]
-    assert sandbox.hosts.read_text() == STOCK_HOSTS
+    assert sorted(sandbox.helper_verbs()) == ["dns-on", "hosts-on"]
+    assert sandbox.hosts.read_text() == STOCK_HOSTS + "\n" + BLOCK_NOW
     assert not sandbox.weather.exists() and not sandbox.shell_json.exists()
-    assert not sandbox.claude.parent.exists()
-    assert set(sandbox.state()["rows"]) == {"dns"}
+    assert not sandbox.claude.parent.exists() and not sandbox.proton.parent.exists()
+    assert set(sandbox.state()["rows"]) == {"dns", "hosts"}
     rep = run("off")
     assert rep["overall"] == "off" and sandbox.state()["rows"] == {}
+    assert sandbox.hosts.read_text() == STOCK_HOSTS
 
 
 def test_the_agents_widget_not_on_the_bar_is_not_applicable(sandbox, run):

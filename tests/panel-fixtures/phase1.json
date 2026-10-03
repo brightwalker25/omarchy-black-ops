@@ -16,11 +16,12 @@
   "pending": [],
   "helperInstalled": true,
   "helperState": "outdated",
-  "helperNote": "The root helper is from another version. Run the installer again.",
+  "helperNote": "The root helper installed on this machine is from version 0.3.0, not from this version of Black Ops, so the rows that need root are left as they are. Open a terminal and run sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install to install this version's helper, then switch Black Ops on again.",
+  "helperCommand": "sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install",
   "rows": [
     {
       "id": "hosts",
-      "label": "Claude Code telemetry host",
+      "label": "Telemetry hosts",
       "value": "in place",
       "detail": "",
       "why": "",
@@ -51,7 +52,7 @@
       "oneWay": false,
       "optional": false,
       "privileged": true,
-      "error": "The root helper is from another version. Run the installer again.",
+      "error": "The root helper installed on this machine is from version 0.3.0, not from this version of Black Ops, so the rows that need root are left as they are. Open a terminal and run sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install to install this version's helper, then switch Black Ops on again.",
       "registered": false,
       "source": "black-ops",
       "switchable": true

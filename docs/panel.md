@@ -22,7 +22,7 @@ headline and then names what is red and what is amber, for example:
 ```
 Black Ops: On, but someapp contacted a telemetry host
 Red: someapp to Datadog
-Amber: Claude Code telemetry host has slipped; 1 software watch item to review
+Amber: Telemetry hosts has slipped; 1 software watch item to review
 ```
 
 ## The software watch row

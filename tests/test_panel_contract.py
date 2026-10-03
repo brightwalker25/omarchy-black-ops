@@ -17,7 +17,8 @@ NAMES = sorted(p.stem for p in FIXTURES.glob("*.json"))
 # Section 4.1, and the fields 0.2 already printed.
 TOP = {"overall", "colour", "slipped", "unapplied", "attention", "leaks", "flagged", "watch",
        "listen", "omarchy", "rowsD", "generatedAt", "version", "master", "headline", "pending",
-       "helperInstalled", "helperState", "helperNote", "rows", "canPair", "pairSecondsLeft"}
+       "helperInstalled", "helperState", "helperNote", "helperCommand", "rows", "canPair",
+       "pairSecondsLeft"}
 # Section 4.2.
 ROW = {"id", "status", "colour", "label", "value", "detail", "why", "error", "intended",
        "inPlace", "optional", "privileged", "oneWay", "managed", "switchable", "registered",

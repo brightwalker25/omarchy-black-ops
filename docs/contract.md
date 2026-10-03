@@ -30,7 +30,9 @@ Where this file says "may", the choice is the builder's.
    A static finding, a slipped protection, a missing hook or a stale scan is
    amber at most. When anything is red, the overall colour is red.
 3. Detection may cover any program on the machine. Anything that switches
-   something covers stock Omarchy only.
+   something is one of Black Ops's own rows, which bar telemetry that is not
+   essential for a program to work, in stock Omarchy and in apps you install
+   yourself.
 4. The account name and `/home/<name>` never appear in a file in the
    repository. Paths are written as `~/...` in docs and built from `$HOME` or
    the XDG variables in code. Files outside the repository that the

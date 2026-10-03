@@ -7,27 +7,19 @@ import sys
 
 import pytest
 
-from conftest import (HAND_HOSTS, HOSTS_01, HOSTS_01_OLLAMA, REPO, STOCK_HOSTS, lan_con,
-                      lan_machine, lan_state)
+from conftest import (BLOCK_02, BLOCK_NOW, DATADOG, HAND_HOSTS, HOSTS_01, HOSTS_01_OLLAMA, REPO,
+                      STOCK_HOSTS, TELEMETRY_HOSTS, lan_con, lan_machine, lan_state)
 
 # Verbs 0.1 had. The 0.2 helper refuses them, and the rule no longer names
 # them, so after the installer has run once more they stop working.
 REMOVED_VERBS = ("ollama-block-on", "ollama-block-off", "ollama-dropin-on",
                  "ollama-dropin-off", "onnx-lock", "onnx-unlock")
-DATADOG = "http-intake.logs.us5.datadoghq.com"
 NIGHTLOOM_LINES = """\
 # onnxruntime telemetry and ComfyUI Sentry, blocked for Nightloom
 0.0.0.0 mobile.events.data.microsoft.com
 :: mobile.events.data.microsoft.com
 0.0.0.0 o4507954455314432.ingest.us.sentry.io
 :: o4507954455314432.ingest.us.sentry.io
-"""
-BLOCK_02 = f"""\
-# BEGIN black-ops
-# Managed by the Black Ops bar plugin. Switch it off there rather than editing here.
-0.0.0.0 {DATADOG}
-:: {DATADOG}
-# END black-ops
 """
 
 
@@ -136,11 +128,11 @@ def test_distrusts_a_folder_others_can_write(helper, tmp_path):
 def test_migrates_hand_written_lines_into_the_block(helper):
     out = helper.edit_hosts(HAND_HOSTS, True)
     outside, inner = helper.split_block(out)
-    assert helper.block_hosts(inner) == {DATADOG}
+    assert helper.block_hosts(inner) == set(TELEMETRY_HOSTS)
     assert out.count(f" {DATADOG}\n") == 2
     # Lines for other hosts, written by hand, are not the block's and stay
     # exactly where they were.
-    assert out == HAND_HOSTS.replace(f"0.0.0.0 {DATADOG}\n:: {DATADOG}\n", "") + "\n" + BLOCK_02
+    assert out == HAND_HOSTS.replace(f"0.0.0.0 {DATADOG}\n:: {DATADOG}\n", "") + "\n" + BLOCK_NOW
 
 
 def test_hosts_on_is_idempotent(helper):
@@ -154,28 +146,45 @@ def test_hosts_off_leaves_the_stock_file(helper):
     assert helper.edit_hosts(STOCK_HOSTS, False) == STOCK_HOSTS
 
 
-def test_hosts_on_rewrites_a_01_block_to_hold_only_datadog(helper):
+def test_hosts_on_rewrites_a_01_block_to_hold_only_the_telemetry_hosts(helper):
     out = helper.edit_hosts(HOSTS_01, True)
-    assert out == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_02
+    assert out == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_NOW
     _, inner = helper.split_block(out)
-    assert helper.block_hosts(inner) == {DATADOG}
+    assert helper.block_hosts(inner) == set(TELEMETRY_HOSTS)
+
+
+def test_hosts_on_completes_a_block_from_an_earlier_version(helper):
+    # 0.2.0 to 0.4.0 blocked the Datadog host alone.
+    out = helper.edit_hosts(STOCK_HOSTS + "\n" + BLOCK_02, True)
+    assert out == STOCK_HOSTS + "\n" + BLOCK_NOW
+    assert helper.edit_hosts(out, False) == STOCK_HOSTS
+
+
+@pytest.mark.parametrize("herdr", [True, False])
+def test_switching_herdr_keeps_a_block_from_an_earlier_version(helper, herdr):
+    # Switching the herdr group alone must not take out telemetry hosts an
+    # earlier block holds, although it holds fewer than this version would.
+    out = helper.edit_hosts(STOCK_HOSTS + "\n" + BLOCK_02, herdr=herdr)
+    _, inner = helper.split_block(out)
+    assert helper.block_hosts(inner) == {DATADOG} | ({"herdr.dev"} if herdr else set())
+    assert out.count(f" {DATADOG}\n") == 2
 
 
 def test_ollama_lines_in_a_01_block_move_out_as_well(helper):
     out = helper.edit_hosts(HOSTS_01_OLLAMA, True)
     assert out == (STOCK_HOSTS + "\n" + NIGHTLOOM_LINES +
                    "# ollama.com, blocked for Nightloom\n0.0.0.0 ollama.com\n:: ollama.com\n"
-                   "\n" + BLOCK_02)
+                   "\n" + BLOCK_NOW)
 
 
 @pytest.mark.parametrize("start", [HOSTS_01, HOSTS_01_OLLAMA])
 def test_hosts_off_never_removes_the_microsoft_or_sentry_lines(helper, start):
     # Straight from a 0.1 block, and after 0.2 has rewritten it: either way
-    # only the Datadog pair and the markers go.
+    # only the telemetry hosts and the markers go.
     for text in (start, helper.edit_hosts(start, True)):
         out = helper.edit_hosts(text, False)
         assert "# BEGIN black-ops" not in out and "# END black-ops" not in out
-        assert DATADOG not in out
+        assert not any(h in out for h in TELEMETRY_HOSTS)
         assert out.startswith(STOCK_HOSTS + "\n" + NIGHTLOOM_LINES)
         for host in ("mobile.events.data.microsoft.com", "o4507954455314432.ingest.us.sentry.io"):
             assert f"0.0.0.0 {host}\n" in out and f":: {host}\n" in out

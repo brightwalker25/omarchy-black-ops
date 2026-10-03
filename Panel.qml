@@ -80,6 +80,9 @@ Panel {
   // Set by the script when the root helper is missing, or when the installed
   // copy is from another version and has to be installed again.
   readonly property string helperNote: rep && rep.helperNote ? String(rep.helperNote) : ""
+  // The installer command the note names, for the Copy command button.
+  readonly property string helperCommand: rep && rep.helperCommand ? String(rep.helperCommand) : ""
+  property bool commandCopied: false
 
   readonly property var watchItems: Model.itemsFor(rep, "watch")
   readonly property var listenItems: Model.itemsFor(rep, "listen")
@@ -212,6 +215,15 @@ Panel {
 
   function setRow(id, on) {
     root.act(["row", id, on ? "on" : "off"])
+  }
+
+  // Puts the installer command on the clipboard. Nothing is run: the
+  // command needs sudo, so it is for a terminal, not for the panel.
+  Process {
+    id: copier
+    command: ["wl-copy", "--", root.helperCommand]
+    running: false
+    onExited: function(exitCode) { root.commandCopied = exitCode === 0 }
   }
 
   Process {
@@ -1063,6 +1075,16 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+
+            SmallButton {
+              visible: root.helperCommand !== ""
+              text: root.commandCopied ? "Copied" : "Copy command"
+              onClicked: {
+                root.commandCopied = false
+                if (root.fixture !== "") console.log("black-ops panel: copy " + root.helperCommand)
+                else copier.running = true
+              }
             }
           }
         }

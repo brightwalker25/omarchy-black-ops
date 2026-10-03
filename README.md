@@ -1,19 +1,22 @@
 # omarchy-black-ops
 
-One switch in the Omarchy bar for a set of privacy protections in stock
-Omarchy. Switched on, it keeps the weather panel from sending your precise
-location, stops the Agents panel from asking services you have not set up,
-stops systemd-resolved from falling back to public DNS servers, turns off
-Claude Code's telemetry with a hosts file entry as a backstop, keeps
-Bluetooth from accepting pairing, stops the
-host name and hardware MAC
-address reaching every network, sets Chromium's privacy policies, turns off
-NetworkManager's connectivity check and Avahi's announcements, gives each
-web app a browser profile of its own, turns off usage reports in the
-developer tools Omarchy installs and Neovim's plugin update check, and sets
-the usual opt-out variables such as `DO_NOT_TRACK`. Nine more protections
-are optional and off until you switch each one on. Switched off, Black Ops removes all of that
-again and leaves the machine as it ships.
+One switch in the Omarchy bar for a set of privacy protections in Omarchy
+and the apps you install on it. Its rule is simple: unless telemetry is
+essential for a program to work, it is barred. Switched on, it keeps the
+weather panel from sending your precise location, stops the Agents panel
+from asking services you have not set up, stops systemd-resolved from
+falling back to public DNS servers, turns off Claude Code's telemetry, blocks
+the telemetry, analytics and crash report hosts of Claude Code, Codex,
+1Password, Brave, Firefox-based browsers such as Zen, and Google Analytics
+in `/etc/hosts`, keeps Bluetooth from accepting pairing, stops the host name
+and hardware MAC address reaching every network, sets Chromium's privacy
+policies, turns off NetworkManager's connectivity check and Avahi's
+announcements, gives each web app a browser profile of its own, turns off
+usage reports in the developer tools Omarchy installs and Neovim's plugin
+update check, sets the usual opt-out variables such as `DO_NOT_TRACK`, and
+turns off the Proton VPN app's crash reports. Nine more protections are
+optional and off until you switch each one on. Switched off, Black Ops
+removes all of that again and leaves the machine as it ships.
 
 A watchdog checks every ten minutes that each protection is still in place.
 When one has slipped, which is usually an update putting a file back, the
@@ -26,10 +29,12 @@ nothing sensitive. See [Privacy](#privacy).
 
 ## What this solves
 
-Each protection answers one problem found in stock Omarchy 4.0.4 in a privacy
-audit on 2026-09-23. The audit read the installed code and configuration and
-watched DNS lookups and connections. Each entry says what was seen, in which
-program, and what the fix is. None of it is done by Black Ops itself, which
+Each protection answers one problem. The first thirteen were found in stock
+Omarchy 4.0.4 in a privacy audit on 2026-09-23. The audit read the installed
+code and configuration and watched DNS lookups and connections. The last two
+are in apps you install yourself, which Black Ops has covered since its scope
+was widened to them. Each entry says what was seen, in which program, and
+what the fix is. None of it is done by Black Ops itself, which
 sends nothing anywhere. A row whose program is missing, or not set up yet, is
 shown as not applicable and is left alone.
 
@@ -62,8 +67,9 @@ shown as not applicable and is left alone.
    While it ran, it looked up `http-intake.logs.us5.datadoghq.com`, its
    Datadog intake, every ten to twenty seconds.
    *Solved by:* its own documented switches, `DISABLE_TELEMETRY` and
-   `DISABLE_ERROR_REPORTING`, with that host blocked in `/etc/hosts` as a
-   backstop in case an update stops honouring them.
+   `DISABLE_ERROR_REPORTING`, with that host and its Sentry crash report
+   host blocked in `/etc/hosts` as a backstop in case an update stops
+   honouring them.
 
 5. **Bluetooth accepts pairing from anyone in range.** BlueZ makes the
    adapter pairable whenever it starts it, Omarchy's pairing agent accepts
@@ -131,6 +137,23 @@ shown as not applicable and is left alone.
 13. **Nothing asks developer tools to stay quiet.** None of the common
     opt-out variables, `DO_NOT_TRACK` among them, is set anywhere.
     *Solved by:* a uwsm environment file that sets them for the session.
+    It includes `ORT_DISABLE_TELEMETRY=1`, because the Linux build of
+    onnxruntime, which local AI tools bring in, sends Microsoft telemetry
+    unless told not to.
+
+14. **Apps you install send telemetry they do not need.** Codex sends crash
+    reports to Sentry, 1Password sends telemetry and Sentry crash reports,
+    Brave sends a daily usage ping and P3A analytics, Firefox-based browsers
+    such as Zen send Mozilla telemetry, and Obsidian and OnlyOffice carry
+    Google Analytics. None of it is needed for the program to work, and some
+    of these programs have no switch for it.
+    *Solved by:* their hosts, with Claude Code's, blocked in a marked block
+    in `/etc/hosts`.
+
+15. **The Proton VPN app sends crash reports.** It reports crashes to
+    Sentry unless `anonymous_crash_reports` is false in its settings.
+    *Solved by:* that setting, changed in
+    `~/.config/Proton/VPN/settings.json` and nowhere else.
 
 Optional, off until switched on one by one:
 
@@ -162,17 +185,21 @@ Optional, off until switched on one by one:
   sign-in token to `api.anthropic.com` every 15 minutes. Switched on, the
   panel no longer shows Claude usage; Claude Code itself is not affected.
 
-Black Ops covers what stock Omarchy ships and sets up. Problems in apps you
-install yourself, such as the onnxruntime telemetry that local AI tools can
-bring in, are handled by those apps, not by Black Ops. Those apps can show
-their own protections in the panel through [rows.d](#rows-from-other-stacks),
-where they only report.
+Black Ops used to cover only what stock Omarchy ships and sets up. Its rule
+is now wider: unless telemetry is essential for a program to work, it is
+barred, and that holds for apps you install yourself as well as for the
+ones Omarchy ships. Telemetry a program truly needs in order to work is left
+alone. Other stacks can still show protections of their own in the
+panel through [rows.d](#rows-from-other-stacks), where they only report, and
+what they set up stays theirs: the hosts Nightloom blocks, such as
+onnxruntime's Microsoft endpoint, are left to Nightloom.
 
 **What it does not solve.** It does not inspect traffic, so it cannot see a
 new phone-home that nobody has found yet; the watchdog only confirms that the
-known fixes are still in place. It does not stop what your browser, mail or
-other everyday apps send, and it does not replace a VPN or a firewall. Data
-that was sent before a protection was switched on cannot be recalled.
+known fixes are still in place. Beyond the hosts and settings listed here, it
+does not stop what your browser, mail or other everyday apps send, and it
+does not replace a VPN or a firewall. Data that was sent before a protection
+was switched on cannot be recalled.
 
 ## The bar and the panel
 
@@ -217,7 +244,7 @@ omarchy-shell brightwalker25.black-ops switchOff
 | Agents panel | Leaves Claude on, turns Codex and Fireworks off | no |
 | DNS fallback servers | Adds a drop-in with an empty `FallbackDNS=` and restarts systemd-resolved | yes |
 | Claude Code telemetry | Sets `DISABLE_TELEMETRY` and `DISABLE_ERROR_REPORTING` | no |
-| Claude Code telemetry host | Sinks Claude Code's Datadog intake on IPv4 and IPv6 in /etc/hosts | yes |
+| Telemetry hosts | Sinks twelve telemetry, analytics and crash report hosts on IPv4 and IPv6 in /etc/hosts | yes |
 | Bluetooth pairing | Pairing off, a login service that keeps it off, the adapter named "laptop" | no |
 | Network identity | `/etc/NetworkManager/conf.d/90-black-ops-identity.conf`, and `AddressRandomization=network` in `/etc/iwd/main.conf`, marked, where iwd is installed; Wi-Fi drops for a few seconds while iwd restarts | yes |
 | Chromium privacy policy | `/etc/chromium/policies/managed/black-ops.json`; casting stops working | yes |
@@ -227,6 +254,7 @@ omarchy-shell brightwalker25.black-ops switchOff
 | Developer tool telemetry | The settings above for five tools, in each tool's own configuration | no |
 | Neovim plugin update check | `enabled = false` in the checker table of `~/.config/nvim/lua/config/lazy.lua` | no |
 | Opt-out variables | `~/.config/uwsm/env.d/90-black-ops-opt-out` with `DO_NOT_TRACK=1` and the rest | no |
+| Proton VPN crash reports | `anonymous_crash_reports` set to false in `~/.config/Proton/VPN/settings.json` | no |
 | Update badge (optional) | Takes the badge off the bar | no |
 | herdr update check (optional) | Sinks `herdr.dev` in /etc/hosts | yes |
 | LocalSend firewall port (optional) | Deletes Omarchy's two `53317` rules from ufw | yes |
@@ -269,13 +297,32 @@ nothing else, and removes `env` itself only if the plugin created it. Until
 Claude Code has been started once and made its settings folder, the row is
 not applicable.
 
-**Claude Code telemetry host.** `http-intake.logs.us5.datadoghq.com` is
+**Telemetry hosts.** Its cost: pages and apps that use Google Analytics
+stop reporting your visits to it, and nothing else changes. Each host is
 mapped to `0.0.0.0` and `::` inside a block marked `# BEGIN black-ops` and
-`# END black-ops`, and the resolver cache is flushed after every change.
-Lines for the same host added by hand are moved into the block the first time
-it is switched on, so the file never holds them twice. Any other line found
-inside the block is moved out of it and kept, never deleted. Without Claude
-Code set up, and with no block in place, the row is not applicable.
+`# END black-ops`, and the resolver cache is flushed after every change. The
+hosts are:
+
+- `http-intake.logs.us5.datadoghq.com` and `o1158394.ingest.us.sentry.io`,
+  Claude Code's Datadog intake and Sentry crash reports;
+- `o33249.ingest.us.sentry.io`, Codex's Sentry crash reports;
+- `telemetry.1passwordservices.com` and `core-sentry.1passwordservices.com`,
+  1Password's telemetry and Sentry crash reports;
+- `usage-ping.brave.com` and `star-randsrv.bsg.brave.com`, Brave's daily
+  usage ping and its P3A analytics;
+- `incoming.telemetry.mozilla.org`, the telemetry Firefox-based browsers
+  such as Zen send;
+- `google-analytics.com`, `www.google-analytics.com`,
+  `ssl.google-analytics.com` and `region1.google-analytics.com`, Google
+  Analytics, which Obsidian and OnlyOffice carry.
+
+Lines for the same hosts added by hand are moved into the block the first
+time it is switched on, so the file never holds them twice. Any other line
+found inside the block is moved out of it and kept, never deleted. The row
+applies on every machine, whether or not these programs are installed yet,
+since any of them can be installed at any time. A block written by an
+earlier version holds fewer hosts, and reads as not applied yet, in amber,
+rather than as slipped, until the row is applied again.
 
 **Chromium privacy policy.** The policy includes `EnableMediaRouter`
 set to false, which stops Chromium searching the local network for Cast
@@ -333,7 +380,8 @@ as the debug symbol one, one `export NAME=value` line each, for
 `ASTRO_TELEMETRY_DISABLED=1`, `GATSBY_TELEMETRY_DISABLED=1`,
 `TURBO_TELEMETRY_DISABLED=1`, `STORYBOOK_DISABLE_TELEMETRY=1`,
 `AZURE_CORE_COLLECT_TELEMETRY=0`, `POWERSHELL_TELEMETRY_OPTOUT=1`,
-`SAM_CLI_TELEMETRY=0`, `VCPKG_DISABLE_METRICS=1` and `HINT_TELEMETRY=off`.
+`SAM_CLI_TELEMETRY=0`, `VCPKG_DISABLE_METRICS=1`, `HINT_TELEMETRY=off` and
+`ORT_DISABLE_TELEMETRY=1`, onnxruntime's switch.
 Claude Code reads `DO_NOT_TRACK` exactly as it reads `DISABLE_TELEMETRY`,
 which the Claude Code telemetry row sets already, so it changes nothing else
 there. The row also sets the variables the session does not have yet in the
@@ -341,6 +389,19 @@ systemd user manager, so programs started from the desktop get them at
 once; they apply fully from the next login. Switching off removes the file
 and unsets only the variables it set. Variables already set by hand in the
 session are adopted. Without uwsm, which reads the file, the row is not
+applicable. A file written by an earlier version, without
+`ORT_DISABLE_TELEMETRY`, reads as not applied yet until the row is applied
+again, and switching off removes it as well.
+
+**Proton VPN crash reports.** There is no cost: the VPN works exactly as
+before. Only `anonymous_crash_reports` in
+`~/.config/Proton/VPN/settings.json` is changed, to `false`, and the rest of
+the file is kept as it was. Quit the app before switching this on, because
+it may write its own value back when it closes, which turns the row amber.
+Switching off puts back the value it had, or takes the key out again if
+Black Ops added it. Crash reports you had already turned off in the app are
+adopted, and switching off leaves them off, since that was your choice and
+not Black Ops'. Until the app has made its settings file, the row is not
 applicable.
 
 **LAN discovery over a VPN.** There is no cost, and nothing changes while
@@ -398,8 +459,8 @@ on only if this row turned it off. The main switch never switches it on.
 Off means the machine as it ships. Switching off undoes every row the plugin
 applied or adopted:
 
-- the hosts block goes, with the Datadog lines in it, and every line outside
-  it stays;
+- the hosts block goes, with the telemetry host lines in it, and every line
+  outside it stays;
 - the DNS, network identity and connectivity drop-ins and the Chromium
   policy file are removed, and the services are told to reload;
 - the marked lines in `avahi-daemon.conf`, `fwupd.conf` and Bluetooth's
@@ -423,6 +484,9 @@ applied or adopted:
 - Neovim's update checker is set back to `enabled = true`;
 - the opt-out variables file goes, and the variables it set in the running
   session are unset;
+- the Proton VPN app's `anonymous_crash_reports` is put back as it was, or
+  taken out if Black Ops added it; one that was already false when the row
+  was adopted is set to `true`, as the app ships;
 - an optional row's change is undone in the same way.
 
 The weather location stays on its grid square, as described above.
@@ -444,9 +508,9 @@ passes. Until then the check is repeated with that wording on every tick.
 
 ## Software watch and listen mode
 
-Two optional rows look past stock Omarchy. They report on any program, but
-the only fixes Black Ops switches are still the stock ones above; for
-anything else the panel shows the opt-out it found.
+Two optional rows look further. They report on any program, but the only
+fixes Black Ops switches are the ones above; for anything else the panel
+shows the opt-out it found.
 
 The software watch notes everything you install, from pacman and the AUR,
 Flatpak, AppImages, pip, npm and mise, and scans each new or changed item
@@ -477,6 +541,22 @@ there can never make Black Ops run a program or send anything. A file that
 anyone else can write, or that does not follow the format, is skipped and
 named in the panel. The format is in [docs/contract.md](docs/contract.md),
 section 10.
+
+## Upgrading from 0.4
+
+The helper has changed, so run the installer once more after pulling:
+
+```
+sudo ~/Work/omarchy-black-ops/bin/black-ops-install
+```
+
+Until then the rows that need root say the helper needs reinstalling. The
+hosts block from 0.4.0, which holds the Datadog host alone, then reads as not
+applied yet, in amber, rather than as slipped, and so does an opt-out
+variables file without `ORT_DISABLE_TELEMETRY`. Use "Apply what is new" in
+the panel, or run `bin/black-ops on`, which adds the rest. The Proton VPN
+crash reports row is new; where the app is installed, it is put in place the
+same way, or adopted if crash reports are already off.
 
 ## Upgrading from 0.3
 
@@ -518,6 +598,10 @@ install. They left Black Ops in 0.2.0 without being undone:
   above it with a comment saying what they are for. They stay blocked, and
   switching Black Ops off no longer removes them.
 - Everything else those rows managed is left exactly as it is.
+- Since then the Proton VPN app's crash reports have a row again, under the
+  new id `proton-crash`. A setting 0.1 left off is adopted the next time
+  Black Ops is switched on, and unlike other adopted rows, switching off
+  then leaves it off, as it was found.
 
 The helper that makes the changes needing root is different in 0.2.0, so run
 the installer once more after pulling:
@@ -681,7 +765,7 @@ bin/black-ops row claude off   # one row
 
 Row ids: `weather`, `agents`, `dns`, `claude`, `hosts`, `bluetooth`,
 `identity`, `chromium`, `connectivity`, `avahi`, `webapps`, `dev-telemetry`,
-`nvim-checker`, `opt-out-env`, and the optional `update-badge`, `herdr`,
+`nvim-checker`, `opt-out-env`, `proton-crash`, and the optional `update-badge`, `herdr`,
 `localsend`, `lan-discovery`, `debuginfod`, `crash-watch`, `fwupd-p2p`,
 `avahi-daemon`, `bt-privacy` and `claude-usage`. `bin/black-ops pair` opens the Bluetooth
 pair window.
@@ -730,6 +814,9 @@ the sandbox. The tests refuse to run as root.
   machine whose `/etc/hosts` is a link cannot use the hosts row.
 - The LAN discovery row covers IPv4 link-local multicast, which LocalSend
   uses. IPv6 link-local multicast is not routed by it.
+- The telemetry hosts row blocks the hosts listed above by name. A program
+  that moves its telemetry to another host, or connects to a fixed address,
+  is not covered until the list is updated.
 
 ## Written with AI help
 

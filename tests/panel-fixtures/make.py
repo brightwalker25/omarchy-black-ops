@@ -37,7 +37,7 @@ def row(id, label, status="ok", value="in place", intended=True, **kw):
 
 def base_rows(master=True):
     rows = [
-        row("hosts", "Claude Code telemetry host", privileged=True),
+        row("hosts", "Telemetry hosts", privileged=True),
         row("dns", "DNS fallback servers", privileged=True),
         row("weather", "Weather location", value="rounded"),
         row("bluetooth", "Bluetooth pairing", value="not pairable"),
@@ -75,6 +75,7 @@ def report(**kw):
         "overall": "ok", "colour": "green", "headline": "On, 7 protections holding",
         "slipped": [], "unapplied": [], "attention": [], "leaks": [], "pending": [],
         "helperInstalled": True, "helperState": "current", "helperNote": "",
+        "helperCommand": "",
         "rows": base_rows(), "canPair": True, "pairSecondsLeft": 0,
         "omarchy": {"version": "4.0.4-1", "recorded": "4.0.4-1", "changed": False},
         "flagged": [], "watch": watch_obj(), "listen": listen_obj(),
@@ -234,11 +235,12 @@ def fixtures():
     rep = report(overall="warn", colour="amber", headline="On, but DNS fallback servers has slipped",
                  slipped=["dns"], unapplied=["debuginfod"], pairSecondsLeft=42,
                  helperState="outdated",
-                 helperNote="The root helper is from another version. Run the installer again.",
+                 helperNote="The root helper installed on this machine is from version 0.3.0, not from this version of Black Ops, so the rows that need root are left as they are. Open a terminal and run sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install to install this version's helper, then switch Black Ops on again.",
+                 helperCommand='sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install',
                  rowsD={"skipped": [{"file": "broken.json", "why": "not valid JSON"}]})
     set_row(rep, "dns", status="warn", inPlace=False, value="Google, Cloudflare",
             why="Fallback servers are set again. Switch on again to put it back.",
-            error="The root helper is from another version. Run the installer again.")
+            error="The root helper installed on this machine is from version 0.3.0, not from this version of Black Ops, so the rows that need root are left as they are. Open a terminal and run sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install to install this version's helper, then switch Black Ops on again.")
     set_row(rep, "debuginfod", status="warn", inPlace=False, value="on",
             why="Not put in place yet. Switch on again to apply it.")
     rep["rows"].append(row("nightloom/ollama-block", "ollama.com block", value="blocked",

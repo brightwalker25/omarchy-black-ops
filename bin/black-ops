@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Switch a fixed set of privacy protections for stock Omarchy on and off,
+"""Switch a fixed set of privacy protections for Omarchy on and off,
 and report whether each one is still in place, for the
 brightwalker25.black-ops bar panel and for use from a terminal.
 
 Design notes:
 
-- Black Ops covers what stock Omarchy ships and sets up. Leaks that belong
-  to an app you install yourself are that app's to handle, and rows for them
-  were removed in 0.2.0 without undoing them (see FORMER_ROWS).
+- Unless telemetry is absolutely essential for a program to work, it is
+  barred, in what stock Omarchy ships and in apps you install yourself.
+  Rows that 0.2.0 removed were forgotten without undoing them (see
+  FORMER_ROWS), and what another stack sets up for itself stays its own.
 - The script decides and the panel renders. Whether a protection is in
   place, whether it has slipped, and what switching it would do are worked
   out here and published as JSON. The QML holds no policy, and every answer
@@ -37,7 +38,7 @@ Design notes:
 - Optional rows are off by default, have their own switch, and are never
   switched on by the main switch.
 - Rows that other stacks register in rows.d only report. They have no
-  switch, because switchable fixes cover stock Omarchy only.
+  switch, because only Black Ops's own rows switch anything.
 - It sends nothing anywhere and logs nothing. The state file holds row
   names, the words "applied" or "adopted", times, short error messages, the
   Omarchy version last checked, and what a few rows need to put things back
@@ -69,15 +70,29 @@ HELPER_DEFAULT = "/usr/local/lib/omarchy-black-ops/apply"
 # The helper as it is in this plugin folder. The installed copy should be
 # byte for byte the same; when it is not, it is from another version.
 HELPER_SOURCE = Path(__file__).resolve().parent.parent / "system" / "apply"
-INSTALL_HINT = ("The one-time install has not been done. Run "
-                "sudo bin/black-ops-install from the plugin folder.")
+# The installer beside this script, as the panel and the text output show it.
+INSTALLER = Path(os.path.abspath(__file__)).parent / "black-ops-install"
+INSTALL_HINT = ("The one-time install has not been done. Open a terminal and run "
+                "{cmd}, then switch Black Ops on.")
 OUTDATED_HINT = ("The root helper installed on this machine is from {old}, not from this "
                  "version of Black Ops, so the rows that need root are left as they are. "
-                 "Run sudo bin/black-ops-install once more from the plugin folder.")
+                 "Open a terminal and run {cmd} to install this version's helper, then "
+                 "switch Black Ops on again.")
 
 # These must match system/apply; a test checks that they do.
 TELEMETRY_HOSTS = (
-    "http-intake.logs.us5.datadoghq.com",
+    "http-intake.logs.us5.datadoghq.com",     # Claude Code, Datadog
+    "o1158394.ingest.us.sentry.io",           # Claude Code, Sentry crash reports
+    "o33249.ingest.us.sentry.io",             # Codex, Sentry crash reports
+    "telemetry.1passwordservices.com",        # 1Password telemetry
+    "core-sentry.1passwordservices.com",      # 1Password, Sentry crash reports
+    "usage-ping.brave.com",                   # Brave daily usage ping
+    "star-randsrv.bsg.brave.com",             # Brave P3A analytics (STAR)
+    "incoming.telemetry.mozilla.org",         # Firefox-based browsers, such as Zen
+    "google-analytics.com",                   # Google Analytics, in Obsidian, OnlyOffice
+    "www.google-analytics.com",               # and pages that embed it
+    "ssl.google-analytics.com",
+    "region1.google-analytics.com",
 )
 HERDR_HOSTS = (
     "herdr.dev",
@@ -152,6 +167,7 @@ OPT_OUT_VARS = (
     ("SAM_CLI_TELEMETRY", "0"),
     ("VCPKG_DISABLE_METRICS", "1"),
     ("HINT_TELEMETRY", "off"),
+    ("ORT_DISABLE_TELEMETRY", "1"),
 )
 CRASH_UNIT = "omarchy-crash-watch.service"
 # fwupd's remote flags for peer-to-peer sharing, as fwupdmgr reports them.
@@ -207,6 +223,8 @@ class Context:
         self.watch_dir = Path(state_home) / "black-ops"
         claude_dir = e.get("CLAUDE_CONFIG_DIR") or str(self.home / ".claude")
         self.claude_settings = Path(claude_dir) / "settings.json"
+        self.proton_settings = Path(e.get("XDG_CONFIG_HOME") or str(self.home / ".config")) \
+            / "Proton/VPN/settings.json"
         self.weather = self.home / ".local/state/omarchy/settings/weather.json"
         self.shell_json = self.home / ".config/omarchy/shell.json"
         self.hosts = self.etc / "hosts"
@@ -295,13 +313,24 @@ class Context:
                     self._helper = ("outdated", old)
         return self._helper
 
+    def install_command(self):
+        """The command that installs the helper, with the home folder written
+        as ~ so that the account name never appears in the report. It works
+        the same in fish and bash."""
+        path = str(INSTALLER)
+        home = str(self.home).rstrip("/")
+        if path.startswith(home + "/"):
+            path = "~" + path[len(home):]
+        return f"sudo {path}"
+
     def helper_note(self):
         """What the panel should say about the helper, or ""."""
         state, old = self.helper_state()
         if state == "missing":
-            return INSTALL_HINT
+            return INSTALL_HINT.format(cmd=self.install_command())
         if state == "outdated":
-            return OUTDATED_HINT.format(old=f"version {old}" if old else "a version before 0.2.0")
+            return OUTDATED_HINT.format(old=f"version {old}" if old else "a version before 0.2.0",
+                                        cmd=self.install_command())
         return ""
 
     def helper(self, verb):
@@ -315,7 +344,8 @@ class Context:
             return out.strip()
         err = (err or "").strip()
         if err.startswith("sudo:") or "password is required" in err:
-            raise ActionError("sudo will not run the helper without a password. " + INSTALL_HINT)
+            raise ActionError("sudo will not run the helper without a password. "
+                              + INSTALL_HINT.format(cmd=self.install_command()))
         last = err.splitlines()[-1] if err else f"{verb} failed"
         last = re.sub(r"^black-ops apply: (?:[a-z-]+: )?", "", last)
         raise ActionError(last[:300])
@@ -498,12 +528,17 @@ class Row:
 
 class HostsRow(Row):
     id = "hosts"
-    label = "Claude Code telemetry host"
+    label = "Telemetry hosts"
     privileged = True
-    about = ("Sinks http-intake.logs.us5.datadoghq.com, the Datadog intake Claude "
-             "Code sends its telemetry to, on IPv4 and IPv6, in a marked block in "
-             "/etc/hosts. A backstop for the row above, in case a Claude Code "
-             "update stops honouring its switches.")
+    about = ("Sinks the telemetry, analytics and crash report hosts of programs that "
+             "send them without needing to, on IPv4 and IPv6, in a marked block in "
+             "/etc/hosts: Claude Code's Datadog and Sentry intakes, Codex's Sentry, "
+             "1Password's telemetry and Sentry, Brave's usage ping and P3A, the "
+             "Mozilla telemetry Firefox-based browsers such as Zen send, and Google "
+             "Analytics, which Obsidian and OnlyOffice carry. None of them is needed "
+             "for the program to work. Pages that use Google Analytics stop reporting "
+             "your visits to it. A backstop for the switches, in case an update stops "
+             "honouring them, and the only barrier for programs that have none.")
 
     def check(self, ctx, rec=None):
         text = read_text(ctx.hosts)
@@ -515,10 +550,6 @@ class HostsRow(Row):
                           "The black-ops block in /etc/hosts has a missing or "
                           "extra marker. Fix it by hand; the plugin will not guess.")
         n = sum(1 for h in TELEMETRY_HOSTS if h in v["blocked"])
-        if n == 0 and not ctx.claude_settings.parent.is_dir():
-            return result("na", "Claude Code not set up",
-                          "Claude Code has no settings folder for this account, so there "
-                          "is nothing for this block to back up.")
         in_block = all(h in v["block"] for h in TELEMETRY_HOSTS)
         stray = any(h in v["hand"] for h in TELEMETRY_HOSTS)
         if n == len(TELEMETRY_HOSTS) and in_block and not stray and not v["foreign"]:
@@ -535,6 +566,11 @@ class HostsRow(Row):
                           work=True)
         if n == 0:
             return result("out", "not blocked", self.about)
+        if all(h in v["block"] for h in TELEMETRY_HOSTS[:n]) and \
+                not any(h in v["blocked"] for h in TELEMETRY_HOSTS[n:]):
+            # The block an earlier version wrote, with fewer hosts in it.
+            return result("partial", f"{n} of {len(TELEMETRY_HOSTS)} blocked", self.about,
+                          new=True, why="Black Ops now blocks more hosts than the block has.")
         return result("partial", f"{n} of {len(TELEMETRY_HOSTS)} blocked", self.about)
 
     def apply(self, ctx, chk, rec):
@@ -800,6 +836,54 @@ class ClaudeRow(Row):
             os.unlink(os.path.realpath(ctx.claude_settings))
             return
         atomic_write(ctx.claude_settings, dump_like(text, data))
+
+
+class ProtonCrashRow(Row):
+    id = "proton-crash"
+    label = "Proton VPN crash reports"
+    about = ("Sets anonymous_crash_reports to false in ~/.config/Proton/VPN/settings.json, "
+             "so the Proton VPN app stops sending crash reports to Sentry. The VPN works "
+             "exactly as before. Nothing else in the file is changed. Quit the app before "
+             "switching this on, or it may write its own value back when it closes.")
+
+    def check(self, ctx, rec=None):
+        if not ctx.proton_settings.is_file():
+            return result("na", "not set up", "The Proton VPN app has no settings for this account.")
+        try:
+            _, data = load_json(ctx.proton_settings)
+        except ActionError as exc:
+            return result("partial", "unreadable", str(exc))
+        if not isinstance(data, dict):
+            return result("partial", "unreadable", "settings.json is not an object.")
+        if data.get("anonymous_crash_reports") is False:
+            return result("in", "off", self.about)
+        return result("out", "sending", self.about,
+                      why="The Proton VPN app sends crash reports to Sentry.")
+
+    def apply(self, ctx, chk, rec):
+        text, data = load_json(ctx.proton_settings)
+        if not isinstance(data, dict):
+            raise ActionError("settings.json is not an object, so it has been left alone")
+        rec["had"] = "anonymous_crash_reports" in data
+        rec["was"] = data.get("anonymous_crash_reports")
+        data["anonymous_crash_reports"] = False
+        atomic_write(ctx.proton_settings, dump_like(text, data))
+
+    def revert(self, ctx, rec):
+        # Adopted: crash reports were already off, a choice made in the app
+        # rather than by Black Ops, so switching off leaves it as found.
+        if "had" not in rec:
+            return
+        if not ctx.proton_settings.is_file():
+            return
+        text, data = load_json(ctx.proton_settings)
+        if not isinstance(data, dict) or data.get("anonymous_crash_reports") is not False:
+            return
+        if rec.get("had", True):
+            data["anonymous_crash_reports"] = True if rec.get("was") is None else rec["was"]
+        else:
+            del data["anonymous_crash_reports"]
+        atomic_write(ctx.proton_settings, dump_like(text, data))
 
 
 # ---------------------------------------------------------------- Bluetooth
@@ -2371,7 +2455,8 @@ class OptOutRow(Row):
     about = ("Deno and HashiCorp tools such as Terraform no longer say when a newer "
              "version is out. Sets DO_NOT_TRACK=1 and the standard opt-out variables for "
              "Deno, Next.js, .NET, HashiCorp tools, Astro, Gatsby, Turborepo, Storybook, "
-             "the Azure CLI, PowerShell, the AWS SAM CLI, vcpkg and Hint, in "
+             "the Azure CLI, PowerShell, the AWS SAM CLI, vcpkg, Hint and onnxruntime, "
+             "whose Linux build sends Microsoft telemetry unless told not to, in "
              "~/.config/uwsm/env.d/90-black-ops-opt-out. Claude Code reads DO_NOT_TRACK "
              "as it reads DISABLE_TELEMETRY, and nothing more. Programs started from the "
              "desktop get them at once, and they apply fully from the next login.")
@@ -2384,7 +2469,12 @@ class OptOutRow(Row):
         return [k for k, v in OPT_OUT_VARS if f"{k}={v}" not in have]
 
     def check(self, ctx, rec=None):
-        ours = read_text(ctx.opt_out_dropin) == OPT_OUT_TEXT
+        text = read_text(ctx.opt_out_dropin)
+        ours = text == OPT_OUT_TEXT
+        if text and not ours and text.startswith(OPT_OUT_TEXT.split("\n", 1)[0]):
+            # Written by an earlier version, which set fewer variables.
+            return result("partial", "set, more to add", self.about, new=True,
+                          why="Black Ops now sets more opt-out variables than this file has.")
         if not ours and not ctx.which("uwsm"):
             return result("na", "no uwsm", "uwsm, which reads the variables at login, "
                                            "is not installed.")
@@ -2411,7 +2501,8 @@ class OptOutRow(Row):
                 rec["session"] = sorted(set(rec.get("session") or []) | set(new))
 
     def revert(self, ctx, rec):
-        if read_text(ctx.opt_out_dropin) == OPT_OUT_TEXT:
+        text = read_text(ctx.opt_out_dropin) or ""
+        if text.startswith(OPT_OUT_TEXT.split("\n", 1)[0]):
             ctx.opt_out_dropin.unlink()
             for d in (ctx.uwsm_env_dir, ctx.uwsm_env_dir.parent):
                 with contextlib.suppress(OSError):
@@ -2677,7 +2768,7 @@ class ClaudeUsageRow(AgentsRow):
 # subclass above and an entry here; see Row.
 ROWS = [WeatherRow(), AgentsRow(), DnsRow(), ClaudeRow(), HostsRow(),
         BluetoothRow(), IdentityRow(), ChromiumRow(), ConnectivityRow(), AvahiRow(),
-        WebappsRow(), DevTelemetryRow(), NvimCheckerRow(), OptOutRow(),
+        WebappsRow(), DevTelemetryRow(), NvimCheckerRow(), OptOutRow(), ProtonCrashRow(),
         # Optional: off until switched on one by one.
         UpdateBadgeRow(), HerdrRow(), LocalSendRow(), LanDiscoveryRow(), DebuginfodRow(),
         CrashWatchRow(), FwupdRow(), AvahiDaemonRow(), BtPrivacyRow(), ClaudeUsageRow()]
@@ -2761,7 +2852,7 @@ FORMER_ROWS = {
     "ollama-offline": "0.2.0",  # Ollama cloud features, now Nightloom's
     "ollama-block": "0.2.0",    # the optional ollama.com block, now Nightloom's
     "openwebui": "0.2.0",       # Open WebUI code execution, an optional app
-    "proton": "0.2.0",          # a VPN app's crash reports, an optional app
+    "proton": "0.2.0",          # a VPN app's crash reports, now the proton-crash row
 }
 
 
@@ -3364,6 +3455,12 @@ def status(ctx, st):
             overall = "warn"
             headline = (f"On, but {names_of([labels[i] for i in failed])} "
                         + ("has" if len(failed) == 1 else "have") + " slipped")
+        elif waiting and helper_state == "outdated" and \
+                any(r["privileged"] for r in rows if r["id"] in waiting):
+            # The rows waiting need root, and an outdated helper is never run,
+            # so they wait on the installer. Name that rather than the rows.
+            overall = "warn"
+            headline = "On, but the root helper needs reinstalling"
         elif waiting:
             overall = "warn"
             headline = (f"On, but {names_of([labels[i] for i in waiting])} "
@@ -3416,7 +3513,8 @@ def status(ctx, st):
         "overall": overall, "colour": OVERALL_COLOURS[overall], "headline": headline,
         "slipped": failed, "unapplied": waiting, "attention": attention, "leaks": leaks,
         "pending": pending, "helperInstalled": ctx.helper_installed(),
-        "helperState": helper_state, "helperNote": note, "rows": rows,
+        "helperState": helper_state, "helperNote": note,
+        "helperCommand": ctx.install_command() if note else "", "rows": rows,
         "canPair": bt["intended"] and bt["status"] != "na",
         "pairSecondsLeft": max(0, pair_until(ctx) - now) if bt["status"] != "na" else 0,
         "omarchy": {"version": cur, "recorded": recorded, "changed": changed},

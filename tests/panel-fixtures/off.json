@@ -13,10 +13,11 @@
   "helperInstalled": true,
   "helperState": "current",
   "helperNote": "",
+  "helperCommand": "",
   "rows": [
     {
       "id": "hosts",
-      "label": "Claude Code telemetry host",
+      "label": "Telemetry hosts",
       "value": "stock",
       "detail": "",
       "why": "",

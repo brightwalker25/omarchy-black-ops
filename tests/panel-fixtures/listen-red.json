@@ -17,10 +17,11 @@
   "helperInstalled": true,
   "helperState": "current",
   "helperNote": "",
+  "helperCommand": "",
   "rows": [
     {
       "id": "hosts",
-      "label": "Claude Code telemetry host",
+      "label": "Telemetry hosts",
       "value": "not blocked",
       "detail": "",
       "why": "The block is gone from /etc/hosts. Switch on again to put it back.",

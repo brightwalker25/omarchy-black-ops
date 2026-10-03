@@ -5,14 +5,20 @@ protections those rows stood for must stay in place, now owned by the apps
 concerned, so the upgrade forgets the rows without reverting them, and the
 hosts block gives up the lines it no longer owns without unblocking them.
 Until the helper is reinstalled, the old one is never run, because its
-hosts-off would remove those lines."""
+hosts-off would remove those lines.
+
+Since then Black Ops has widened its scope to telemetry in apps you install
+yourself, so the VPN app's crash reports are a row again, under a new id, and
+the hosts block holds more hosts than the one 0.1 wrote. A 0.1 block reads as
+not applied yet until switched on again."""
 import json
 
 import pytest
 
-from conftest import HOSTS_01, HOSTS_01_OLLAMA, STOCK_HOSTS, state_01
+from conftest import (BLOCK_01, BLOCK_NOW, DATADOG, HOSTS_01, HOSTS_01_OLLAMA, STOCK_HOSTS,
+                      TELEMETRY_HOSTS, state_01)
 
-DATADOG = "http-intake.logs.us5.datadoghq.com"
+PROTON = "proton-crash"
 KEPT = {"hosts", "dns", "weather", "agents", "claude"}
 REMOVED = ("onnx", "ollama-offline", "ollama-block", "openwebui", "proton")
 NIGHTLOOM_LINES = """\
@@ -26,13 +32,6 @@ OLLAMA_LINES = """\
 # ollama.com, blocked for Nightloom
 0.0.0.0 ollama.com
 :: ollama.com
-"""
-BLOCK_02 = f"""\
-# BEGIN black-ops
-# Managed by the Black Ops bar plugin. Switch it off there rather than editing here.
-0.0.0.0 {DATADOG}
-:: {DATADOG}
-# END black-ops
 """
 NIGHTLOOM_HOSTS_LINES = [f"{a} {h}" for h in ("mobile.events.data.microsoft.com",
                                                "o4507954455314432.ingest.us.sentry.io")
@@ -52,13 +51,13 @@ def rows(rep):
 
 
 def not_black_opss(sandbox):
-    """Everything the removed rows managed, as it is now."""
+    """Everything the removed rows managed, as it is now, except the VPN
+    app's crash reports, which the proton-crash row manages again."""
     return {
         "ollama": sandbox.ollama_dropin.read_bytes(),
         "onnx": (sandbox.onnx.stat().st_mode & 0o777, sandbox.is_immutable(sandbox.onnx),
                  sorted(p.name for p in sandbox.onnx.iterdir())),
         "webui": sandbox.webui_values(),
-        "proton": sandbox.proton.read_bytes(),
     }
 
 
@@ -85,19 +84,28 @@ def test_status_forgets_removed_rows_and_changes_nothing_else(upgraded, run):
     assert upgraded.snapshot() == before
     assert not_black_opss(upgraded) == kept_before
     assert [r["id"] for r in rep["rows"]][:5] == ["weather", "agents", "dns", "claude", "hosts"]
-    # The rows added since 0.3.0 have nothing to protect on this machine.
-    # The software watch and listen mode are off, never not applicable, and
-    # so is the Claude usage check while the Agents widget is on the bar.
+    # The rows added since 0.3.0 have nothing to protect on this machine,
+    # except the VPN app's crash reports, which 0.1 switched off and which
+    # read as in place. The software watch and listen mode are off, never
+    # not applicable, and so is the Claude usage check while the Agents
+    # widget is on the bar.
+    assert rows(rep)[PROTON]["inPlace"]
     assert all(r["status"] == "na" for r in rep["rows"][5:]
-               if r["id"] not in ("watch", "listen", "claude-usage"))
-    assert rep["overall"] == "ok", rep
+               if r["id"] not in ("watch", "listen", "claude-usage", PROTON))
+    # The block holds the Datadog host and none of the hosts added since,
+    # which is not applied yet rather than slipped.
+    assert rep["overall"] == "warn", rep
+    assert rep["slipped"] == [] and rep["unapplied"] == ["hosts"]
     assert oct(upgraded.state_file.stat().st_mode & 0o777) == "0o600"
 
 
 def test_status_with_notify_forgets_them_too(upgraded, run):
     run("status", "--notify")
     assert set(upgraded.state()["rows"]) == KEPT
-    assert upgraded.calls("notify-send") == []
+    # The one notice is for the hosts the block does not hold yet. None is
+    # about a removed row.
+    notes = upgraded.calls("notify-send")
+    assert len(notes) == 1 and "Telemetry hosts is not applied yet" in notes[0]
 
 
 def test_every_mention_of_a_removed_row_is_forgotten(upgraded, run, bo):
@@ -128,10 +136,22 @@ def test_a_current_state_file_is_not_rewritten_by_status(upgraded, run):
 
 # ------------------------------------------------------------ the hosts block
 
+def test_a_01_block_reads_as_not_applied_yet(upgraded, run):
+    r = rows(run("status"))["hosts"]
+    assert r["status"] == "warn" and r["value"] == f"1 of {len(TELEMETRY_HOSTS)} blocked"
+    assert "more hosts" in r["why"] and "slipped" not in r["why"]
+
+
 def test_status_says_the_block_needs_tidying(upgraded, run):
+    # A 0.1 block that, besides the hosts 0.1 kept there, holds every host
+    # this version blocks.
+    block = BLOCK_01 + "".join(f"0.0.0.0 {h}\n:: {h}\n" for h in TELEMETRY_HOSTS if h != DATADOG)
+    upgraded.write(upgraded.hosts, STOCK_HOSTS + "\n" + block + "# END black-ops\n")
     r = rows(run("status"))["hosts"]
     assert r["status"] == "ok" and r["value"] == "blocked, block to tidy"
     assert "earlier version" in r["detail"]
+    run("on")
+    assert upgraded.hosts.read_text() == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_NOW
 
 
 def test_on_hands_the_other_hosts_over_without_unblocking_them(upgraded, run):
@@ -139,11 +159,14 @@ def test_on_hands_the_other_hosts_over_without_unblocking_them(upgraded, run):
     rep = run("on")
     assert upgraded.helper_verbs() == ["hosts-on"]
     text = upgraded.hosts.read_text()
-    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_02
+    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_NOW
     assert nightloom_missing_hosts_lines(text) == []
     assert rows(rep)["hosts"]["value"] == "blocked"
     assert rep["overall"] == "ok", rep
-    assert set(upgraded.state()["rows"]) == KEPT
+    # The VPN app's crash reports, off since 0.1, are adopted, not rewritten.
+    assert set(upgraded.state()["rows"]) == KEPT | {PROTON}
+    assert upgraded.state()["rows"][PROTON]["how"] == "adopted"
+    assert json.loads(upgraded.proton.read_text())["anonymous_crash_reports"] is False
     assert not_black_opss(upgraded) == kept_before
 
 
@@ -157,6 +180,8 @@ def test_off_after_the_upgrade_keeps_what_now_belongs_to_nightloom(upgraded, run
     assert nightloom_missing_hosts_lines(text) == []
     assert not upgraded.dns_dropin.exists()
     assert not_black_opss(upgraded) == kept_before
+    # The VPN app's crash reports were already off, so on adopted them, and
+    # off leaves that choice as it was found rather than switching them on.
     assert json.loads(upgraded.proton.read_text())["anonymous_crash_reports"] is False
     assert upgraded.state()["rows"] == {}
 
@@ -175,7 +200,7 @@ def test_an_ollama_block_moves_out_and_stays(sandbox, run):
     sandbox.machine_01(ollama_block=True)
     run("on")
     text = sandbox.hosts.read_text()
-    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + OLLAMA_LINES + "\n" + BLOCK_02
+    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + OLLAMA_LINES + "\n" + BLOCK_NOW
     assert "ollama-block" not in sandbox.state()["rows"]
     run("off")
     assert sandbox.hosts.read_text() == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + OLLAMA_LINES
@@ -198,8 +223,15 @@ def test_an_old_helper_is_reported_and_never_run(sandbox, run):
     rep = run("status")
     assert rep["helperState"] == "outdated"
     assert "a version before 0.2.0" in rep["helperNote"]
-    assert "sudo bin/black-ops-install" in rep["helperNote"]
+    # The note names the installer by its full path, with the home folder
+    # as ~, and the panel gets the same command to copy.
+    assert rep["helperCommand"].startswith("sudo ") and \
+        rep["helperCommand"].endswith("/bin/black-ops-install")
+    assert rep["helperCommand"] in rep["helperNote"]
+    assert "then switch Black Ops on again" in rep["helperNote"]
     assert rep["overall"] == "warn"
+    # The hosts this version adds are still to apply, and only the helper
+    # can apply them, so the headline names the helper, as does the row.
     assert rep["headline"] == "On, but the root helper needs reinstalling"
     assert rows(rep)["hosts"]["error"] == rep["helperNote"]
     # Neither on nor off runs it: 0.1's hosts-off would unblock the hosts
@@ -234,7 +266,10 @@ def test_after_reinstalling_the_helper_is_current(sandbox, run):
     sandbox.install_helper()
     rep = run("status")
     assert rep["helperState"] == "current" and rep["helperNote"] == ""
-    assert rep["overall"] == "ok"
+    # The block still lacks the hosts added since 0.1 until switched on.
+    assert rep["overall"] == "warn" and rep["unapplied"] == ["hosts"]
+    rep = run("on")
+    assert rep["overall"] == "ok", rep
 
 
 def test_the_panel_text_mentions_the_helper(sandbox, bo, capsys):
@@ -243,4 +278,5 @@ def test_the_panel_text_mentions_the_helper(sandbox, bo, capsys):
     assert bo.main(["status", "--text"], sandbox.env) == 0
     out = capsys.readouterr().out
     assert out.splitlines()[0] == "Black Ops: On, but the root helper needs reinstalling"
-    assert out.rstrip().endswith("from the plugin folder.")
+    assert "root helper" in out
+    assert out.rstrip().endswith("then switch Black Ops on again.")

@@ -1,4 +1,4 @@
-"""The rows added in 0.3.0, the colour rule, the Omarchy version check, rows.d
+"""The rows added in 0.3.0 and since, the colour rule, the Omarchy version check, rows.d
 and the hooks for the extensions, against the sandbox.
 
 The stub commands here keep their state in small files in the sandbox, so a
@@ -10,7 +10,8 @@ import sys
 
 import pytest
 
-from conftest import STOCK_HOSTS, lan_con, lan_machine, lan_state
+from conftest import (BLOCK_02, BLOCK_NOW, STOCK_HOSTS, TELEMETRY_HOSTS, lan_con, lan_machine,
+                      lan_state)
 
 PY = sys.executable
 
@@ -1442,3 +1443,117 @@ def test_an_extension_command_can_print_the_status(bo, box, capsys):
     rep = json.loads(capsys.readouterr().out)
     assert rep["overall"] == "off"
     assert (box.home / ".local/state/black-ops/summary.json").is_file()
+
+
+# ------------------------------------------- telemetry in apps you install
+
+PROTON_SETTINGS = ('{\n    "protocol": "wireguard",\n    "killswitch": 1,\n'
+                   '    "anonymous_crash_reports": true,\n    "features": {\n'
+                   '        "netshield": 0\n    }\n}')
+
+
+def test_proton_crash_reports_need_the_vpn_app(box, run):
+    r = rows(run("on"))["proton-crash"]
+    assert r["status"] == "na" and r["switchable"] is False
+    assert not box.proton.parent.exists()
+    assert "proton-crash" not in box.state()["rows"]
+
+
+def test_proton_crash_reports_go_off_and_come_back(box, run):
+    box.write(box.proton, PROTON_SETTINGS)
+    rep = run("status")
+    assert rows(rep)["proton-crash"]["value"] == "sending"
+    rep = run("on")
+    assert rows(rep)["proton-crash"]["status"] == "ok"
+    assert box.state()["rows"]["proton-crash"]["how"] == "applied"
+    data = json.loads(box.proton.read_text())
+    assert data["anonymous_crash_reports"] is False
+    # Nothing else in the file changes, and its layout is kept.
+    assert box.proton.read_text() == PROTON_SETTINGS.replace(
+        '"anonymous_crash_reports": true', '"anonymous_crash_reports": false')
+    run("off")
+    assert box.proton.read_text() == PROTON_SETTINGS
+
+
+def test_proton_crash_reports_key_added_is_removed_again(box, run):
+    text = '{\n    "protocol": "wireguard",\n    "killswitch": 1\n}'
+    box.write(box.proton, text)
+    run("on")
+    assert json.loads(box.proton.read_text()) == {
+        "protocol": "wireguard", "killswitch": 1, "anonymous_crash_reports": False}
+    run("off")
+    assert box.proton.read_text() == text
+
+
+def test_proton_crash_reports_already_off_stay_off(box, run):
+    off = PROTON_SETTINGS.replace('"anonymous_crash_reports": true',
+                                  '"anonymous_crash_reports": false')
+    box.write(box.proton, off)
+    run("on")
+    assert box.state()["rows"]["proton-crash"]["how"] == "adopted"
+    # Turned off in the app, not by Black Ops, so off leaves it as found.
+    run("off")
+    assert box.proton.read_text() == off
+
+
+def test_proton_crash_reports_turned_back_on_have_slipped(box, run):
+    box.write(box.proton, PROTON_SETTINGS)
+    run("on")
+    box.write(box.proton, PROTON_SETTINGS)       # the app writes its own value back
+    rep = run("status")
+    assert rep["slipped"] == ["proton-crash"]
+    run("off")
+    assert box.proton.read_text() == PROTON_SETTINGS
+
+
+def test_a_block_from_an_earlier_version_is_not_applied_yet_rather_than_slipped(box, run):
+    run("on")
+    assert box.hosts.read_text() == STOCK_HOSTS + "\n" + BLOCK_NOW
+    # As 0.2.0 to 0.4.0 left it, with the Datadog host alone.
+    box.write(box.hosts, STOCK_HOSTS + "\n" + BLOCK_02)
+    rep = run("status")
+    r = rows(rep)["hosts"]
+    assert rep["slipped"] == [] and rep["unapplied"] == ["hosts"]
+    assert r["colour"] == "amber" and r["value"] == f"1 of {len(TELEMETRY_HOSTS)} blocked"
+    assert "more hosts" in r["why"]
+    box.clear_calls()
+    rep = run("on")
+    assert box.helper_verbs() == ["hosts-on"]
+    assert rows(rep)["hosts"]["status"] == "ok" and rows(rep)["hosts"]["value"] == "blocked"
+    assert box.hosts.read_text() == STOCK_HOSTS + "\n" + BLOCK_NOW
+    run("off")
+    assert box.hosts.read_text() == STOCK_HOSTS
+
+
+def test_a_block_with_a_host_taken_out_has_still_slipped(box, run):
+    run("on")
+    host = TELEMETRY_HOSTS[3]
+    box.write(box.hosts, box.hosts.read_text().replace(f"0.0.0.0 {host}\n:: {host}\n", ""))
+    rep = run("status")
+    assert rep["slipped"] == ["hosts"] and rep["unapplied"] == []
+
+
+def test_an_opt_out_file_from_an_earlier_version_is_not_applied_yet(box, run, bo):
+    box.stub("uwsm", STUB_TRUE)
+    run("on")
+    dropin = box.home / ".config/uwsm/env.d/90-black-ops-opt-out"
+    assert "export ORT_DISABLE_TELEMETRY=1\n" in dropin.read_text()
+    # As 0.4.0 wrote it, before onnxruntime's switch.
+    old = bo.OPT_OUT_TEXT.replace("export ORT_DISABLE_TELEMETRY=1\n", "")
+    dropin.write_text(old)
+    rep = run("status")
+    assert rep["slipped"] == [] and rep["unapplied"] == ["opt-out-env"]
+    assert rows(rep)["opt-out-env"]["value"] == "set, more to add"
+    rep = run("on")
+    assert rows(rep)["opt-out-env"]["status"] == "ok"
+    assert dropin.read_text() == bo.OPT_OUT_TEXT
+
+
+def test_an_opt_out_file_from_an_earlier_version_is_removed_on_off(box, run, bo):
+    box.stub("uwsm", STUB_TRUE)
+    run("on")
+    dropin = box.home / ".config/uwsm/env.d/90-black-ops-opt-out"
+    dropin.write_text(bo.OPT_OUT_TEXT.replace("export ORT_DISABLE_TELEMETRY=1\n", ""))
+    run("off")
+    assert not dropin.exists() and not (box.home / ".config/uwsm").exists()
+    assert "ORT_DISABLE_TELEMETRY" not in (box.root / "session-env").read_text()

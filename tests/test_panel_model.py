@@ -101,7 +101,7 @@ def test_a_leak_is_red_first_and_named():
     assert red["hosts"][0] == "http-intake.logs.us5.datadoghq.com"
     lines = m["tooltip"].split("\n")
     assert lines[1] == "Red: someapp to Datadog"
-    assert lines[2].startswith("Amber: Claude Code telemetry host has slipped")
+    assert lines[2].startswith("Amber: Telemetry hosts has slipped")
     # A reviewed leak is grey and is not named.
     assert "viewer" not in m["tooltip"]
 

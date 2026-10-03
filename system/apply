@@ -108,7 +108,18 @@ LISTEN_SIGNAL_WAIT = 1.0
 # separately. They are fixed here and in bin/black-ops, and a test checks that
 # the lists agree.
 TELEMETRY_HOSTS = (
-    "http-intake.logs.us5.datadoghq.com",     # Claude Code Datadog
+    "http-intake.logs.us5.datadoghq.com",     # Claude Code, Datadog
+    "o1158394.ingest.us.sentry.io",           # Claude Code, Sentry crash reports
+    "o33249.ingest.us.sentry.io",             # Codex, Sentry crash reports
+    "telemetry.1passwordservices.com",        # 1Password telemetry
+    "core-sentry.1passwordservices.com",      # 1Password, Sentry crash reports
+    "usage-ping.brave.com",                   # Brave daily usage ping
+    "star-randsrv.bsg.brave.com",             # Brave P3A analytics (STAR)
+    "incoming.telemetry.mozilla.org",         # Firefox-based browsers, such as Zen
+    "google-analytics.com",                   # Google Analytics, in Obsidian, OnlyOffice
+    "www.google-analytics.com",               # and pages that embed it
+    "ssl.google-analytics.com",
+    "region1.google-analytics.com",
 )
 HERDR_HOSTS = (
     "herdr.dev",                              # herdr's version and manifest checks
@@ -522,9 +533,11 @@ def edit_hosts(text, telemetry=None, herdr=None):
     hosts = []
     for names, want in groups:
         if want is None:
-            want = all(h in have for h in names)
-        else:
-            strip.update(names)
+            # Left as it is, host by host: a block an earlier version wrote
+            # may hold only some of a group, and those stay blocked.
+            hosts.extend(h for h in names if h in have)
+            continue
+        strip.update(names)
         if want:
             hosts.extend(names)
     outside = strip_hand_lines(outside, strip)
