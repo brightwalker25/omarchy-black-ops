@@ -33,6 +33,20 @@ The new row is optional and stays off until switched on by itself.
   less east to west). A location rounded the old way shows as precise until
   the row is applied again.
 
+### Fixed
+
+- The network identity row now changes the Wi-Fi MAC address when
+  NetworkManager uses iwd as its Wi-Fi backend. iwd chooses the address
+  itself and ignores NetworkManager's `wifi.cloned-mac-address`, so Wi-Fi
+  kept the hardware address and the row stayed amber however often it
+  reconnected. Where iwd is installed, the helper's `identity-on` now also
+  sets `AddressRandomization=network` in `[General]` of `/etc/iwd/main.conf`,
+  a stable address for each network, and restarts iwd, which drops Wi-Fi
+  for a few seconds. The line is marked, a value of your own is commented
+  out and put back on `identity-off`, and a `main.conf` that held nothing
+  else is removed again. A drop-in from an earlier version reads as not
+  applied yet under iwd, so switching on adds the rest.
+
 ## [0.4.0] - 2026-09-24
 
 The helper has new verbs and the Chromium policy a new key, so run the

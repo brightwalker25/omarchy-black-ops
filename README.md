@@ -80,7 +80,10 @@ shown as not applicable and is left alone.
    [omarchy#13054](https://github.com/omacom/omarchy/issues/13054).
    *Solved by:* a NetworkManager drop-in with no host name in DHCP, a stable
    per-network MAC address, and IPv6 temporary addresses. A drop-in of your
-   own that sets some of these is left in place.
+   own that sets some of these is left in place. When NetworkManager uses
+   iwd for Wi-Fi, as Omarchy can, iwd picks the MAC address itself and
+   ignores NetworkManager's setting, so `AddressRandomization=network` is
+   set in `/etc/iwd/main.conf` as well, and iwd is restarted to read it.
 
 7. **Chromium sends what you type and more.** Chromium ships with search
    suggestions, page preloading, Google's error pages, the spelling service
@@ -216,7 +219,7 @@ omarchy-shell brightwalker25.black-ops switchOff
 | Claude Code telemetry | Sets `DISABLE_TELEMETRY` and `DISABLE_ERROR_REPORTING` | no |
 | Claude Code telemetry host | Sinks Claude Code's Datadog intake on IPv4 and IPv6 in /etc/hosts | yes |
 | Bluetooth pairing | Pairing off, a login service that keeps it off, the adapter named "laptop" | no |
-| Network identity | `/etc/NetworkManager/conf.d/90-black-ops-identity.conf` | yes |
+| Network identity | `/etc/NetworkManager/conf.d/90-black-ops-identity.conf`, and `AddressRandomization=network` in `/etc/iwd/main.conf`, marked, where iwd is installed; Wi-Fi drops for a few seconds while iwd restarts | yes |
 | Chromium privacy policy | `/etc/chromium/policies/managed/black-ops.json`; casting stops working | yes |
 | Connectivity check | `/etc/NetworkManager/conf.d/90-black-ops-connectivity.conf` | yes |
 | Avahi announcements | `disable-publishing=yes` in `avahi-daemon.conf`, marked | yes |

@@ -210,6 +210,22 @@ BT_SECTION = "General"
 BT_KEY = "Privacy"
 BT_VALUE = "device"
 
+# And for iwd's main.conf. NetworkManager's cloned-mac-address does nothing
+# when its Wi-Fi backend is iwd, because iwd chooses the address itself.
+# AddressRandomization=network gives each network a stable address of its
+# own, derived from the network and the hardware address, which is what
+# wifi.cloned-mac-address=stable does under wpa_supplicant. iwd reads it from
+# [General] when it starts. Written only where iwd is installed.
+IWD_DIR = "/etc/iwd"
+IWD_NAME = "main.conf"
+IWD_DAEMON = "/usr/lib/iwd/iwd"
+IWD_MARK = "# black-ops: set by the Black Ops bar plugin, and removed when it is switched off"
+IWD_SECTION_MARK = "# black-ops: section added by the Black Ops bar plugin"
+IWD_WAS = "#black-ops-was: "
+IWD_SECTION = "General"
+IWD_KEY = "AddressRandomization"
+IWD_VALUE = "network"
+
 # The two units the Avahi daemon verbs mask and unmask, socket first so that
 # nothing can start the service again while it is being stopped.
 AVAHI_UNITS = ("avahi-daemon.socket", "avahi-daemon.service")
@@ -762,6 +778,63 @@ def change_bt_privacy(on):
     return change_marked(BT_DIR, BT_NAME, bt_privacy_edit, on, restart_bluetooth, "BlueZ")
 
 
+# ------------------------------------------------------------ iwd
+
+def iwd_edit(text, on):
+    """main.conf with AddressRandomization=network in [General]."""
+    return marked_edit(text, on, IWD_SECTION, IWD_KEY, IWD_VALUE,
+                       IWD_MARK, IWD_SECTION_MARK, IWD_WAS)
+
+
+def restart_iwd():
+    """iwd reads main.conf only when it starts, so a running one is
+    restarted. Wi-Fi drops for a few seconds and NetworkManager reconnects
+    it, now with the per-network address."""
+    run([SYSTEMCTL, "try-restart", "iwd.service"])
+
+
+def change_iwd(on):
+    """iwd's address randomization switched on or off. iwd ships no
+    main.conf, so on creates one when it is missing, and off removes a file
+    left with nothing but what on wrote. Nothing happens where iwd is not
+    installed, so a machine on wpa_supplicant gains no stray /etc/iwd."""
+    if not os.path.exists(IWD_DAEMON):
+        return "unchanged"
+    if not on and not os.path.lexists(IWD_DIR):
+        return "unchanged"
+    dfd = open_dir(IWD_DIR, create_last=True)
+    try:
+        info = entry_info(dfd, IWD_NAME)
+        before = read_file(dfd, IWD_NAME)
+        if info is not None and info.st_uid != TRUSTED_UID:
+            raise HelperError(f"{IWD_NAME} is not owned by root; refusing to edit it")
+        after = iwd_edit(before or "", on)
+        if before is not None and after == before:
+            return "unchanged"
+        if before is None and not on:
+            return "unchanged"
+        if not on and not after.strip():
+            remove_file(dfd, IWD_NAME)
+        else:
+            write_file(dfd, IWD_NAME, after if after.endswith("\n") else after + "\n")
+    finally:
+        os.close(dfd)
+    restart_iwd()
+    return "changed"
+
+
+def identity(on):
+    """The NetworkManager drop-in and, where iwd is installed, iwd's address
+    randomization, which together keep the hardware MAC address and the host
+    name off the network."""
+    if on:
+        nm = dropin_on(NM_CONF_DIR, IDENTITY_NAME, IDENTITY_DROPIN, reload_nm)
+    else:
+        nm = dropin_off(NM_CONF_DIR, IDENTITY_NAME, reload_nm, remove_empty=False)
+    iwd = change_iwd(on)
+    return "changed" if "changed" in (nm, iwd) else "unchanged"
+
+
 # ------------------------------------------------------------ avahi daemon
 
 def avahi_mask():
@@ -1054,9 +1127,9 @@ def dispatch(verb):
     if verb == "dns-off":
         return dropin_off(RESOLVED_DROPIN_DIR, DNS_DROPIN_NAME, restart_resolved)
     if verb == "identity-on":
-        return dropin_on(NM_CONF_DIR, IDENTITY_NAME, IDENTITY_DROPIN, reload_nm)
+        return identity(True)
     if verb == "identity-off":
-        return dropin_off(NM_CONF_DIR, IDENTITY_NAME, reload_nm, remove_empty=False)
+        return identity(False)
     if verb == "connectivity-on":
         return dropin_on(NM_CONF_DIR, CONNECTIVITY_NAME, CONNECTIVITY_DROPIN, reload_nm)
     if verb == "connectivity-off":

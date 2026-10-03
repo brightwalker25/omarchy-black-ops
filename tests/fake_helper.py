@@ -29,6 +29,8 @@ apply.CHROMIUM_POLICY_DIR = str(etc / "chromium/policies/managed")
 apply.AVAHI_DIR = str(etc / "avahi")
 apply.FWUPD_DIR = str(etc / "fwupd")
 apply.BT_DIR = str(etc / "bluetooth")
+apply.IWD_DIR = str(etc / "iwd")
+apply.IWD_DAEMON = str(root / "usr/lib/iwd/iwd")
 apply.AVAHI_UNIT_FILE = str(root / "usr/lib/systemd/system/avahi-daemon.service")
 apply.NMCLI = str(root / "bin" / "nmcli")
 apply.IP = str(root / "bin" / "ip")
@@ -45,7 +47,7 @@ apply.require_root = lambda: None
 apply.check_own_install = lambda: None
 
 for value in (apply.ETC, apply.RESOLVED_DROPIN_DIR, apply.NM_CONF_DIR, apply.CHROMIUM_POLICY_DIR,
-              apply.AVAHI_DIR, apply.FWUPD_DIR, apply.BT_DIR, apply.AVAHI_UNIT_FILE, apply.NMCLI, apply.IP, apply.UFW, apply.LISTEN_UNIT,
+              apply.AVAHI_DIR, apply.FWUPD_DIR, apply.BT_DIR, apply.IWD_DIR, apply.IWD_DAEMON, apply.AVAHI_UNIT_FILE, apply.NMCLI, apply.IP, apply.UFW, apply.LISTEN_UNIT,
               apply.LISTEN_CONF, apply.LISTEN_RUN, apply.LISTEN_KEEP):
     assert value.startswith(str(root)), value
 

@@ -219,6 +219,7 @@ class Context:
         self.config_home = Path(e.get("XDG_CONFIG_HOME") or str(self.home / ".config"))
         self.nm_dir = self.etc / "NetworkManager"
         self.identity_dropin = self.nm_dir / "conf.d" / IDENTITY_NAME
+        self.iwd_conf = self.etc / "iwd/main.conf"
         self.connectivity_dropin = self.nm_dir / "conf.d" / CONNECTIVITY_NAME
         self.chromium_policies = self.etc / "chromium/policies/managed"
         self.avahi_conf = self.etc / "avahi/avahi-daemon.conf"
@@ -1168,19 +1169,43 @@ def nm_profile_overrides(ctx):
     return n
 
 
+def nm_wifi_backend(items):
+    """The Wi-Fi backend NetworkManager uses: wpa_supplicant unless its
+    configuration says iwd."""
+    backend = "wpa_supplicant"
+    for section, key, value in items:
+        if section == "device" and key == "wifi.backend":
+            backend = value.strip().lower() or "wpa_supplicant"
+    return backend
+
+
+def iwd_randomizes(ctx):
+    """Whether iwd's main.conf gives each network an address of its own."""
+    value = None
+    for section, key, v in ini_items(read_text(ctx.iwd_conf)):
+        if section == "General" and key == "AddressRandomization":
+            value = v.strip().lower()
+    return value == "network"
+
+
 class IdentityRow(Row):
     id = "identity"
     label = "Network identity"
     privileged = True
     about = ("A NetworkManager drop-in stops sending the host name in DHCP requests, "
              "uses a stable per-network MAC address instead of the hardware one, and "
-             "prefers IPv6 temporary addresses. It applies when a network next connects.")
+             "prefers IPv6 temporary addresses. It applies when a network next connects. "
+             "When NetworkManager uses iwd for Wi-Fi, iwd chooses the MAC address itself, "
+             "so AddressRandomization=network is set in /etc/iwd/main.conf too, and iwd "
+             "is restarted, which drops Wi-Fi for a few seconds.")
 
     def check(self, ctx, rec=None):
         if not ctx.nm_dir.is_dir():
             return result("na", "no NetworkManager", "NetworkManager is not installed.")
+        items = nm_config(ctx)
+        iwd = nm_wifi_backend(items) == "iwd"
         eff, device = {}, set()
-        for section, key, value in nm_config(ctx):
+        for section, key, value in items:
             if key not in IDENTITY_WANTED:
                 continue
             if section == "connection":
@@ -1191,6 +1216,20 @@ class IdentityRow(Row):
         good = [k for k, want in IDENTITY_WANTED.items() if nm_normal(k, eff.get(k)) == want]
         missing = [k for k in IDENTITY_WANTED if k not in good]
         ours = ctx.identity_dropin.is_file()
+        total = len(IDENTITY_WANTED)
+        if iwd:
+            total += 1
+            if iwd_randomizes(ctx):
+                good.append("AddressRandomization")
+            elif not missing and ours:
+                # The drop-in from an earlier version, which did not know iwd
+                # ignores it for Wi-Fi. Switching on adds the iwd setting.
+                return result("partial", "hardware MAC on Wi-Fi", self.about, new=True,
+                              why="NetworkManager uses iwd for Wi-Fi, and iwd ignores "
+                                  "NetworkManager's MAC address setting, so Wi-Fi still "
+                                  "uses the hardware MAC address.")
+            else:
+                missing.append("AddressRandomization")
         if not missing:
             value = "in place" if ours else "in place by hand"
             if device:
@@ -1210,16 +1249,18 @@ class IdentityRow(Row):
                 return result("in", value, self.about, attention=(
                     f"{', '.join(waiting)} still uses its hardware MAC address. The new "
                     "identity applies when it next connects: switch Wi-Fi off and on, or "
-                    "reconnect. If it stays like this, its connection profile sets its own "
-                    "MAC address."))
+                    "reconnect. " + ("Under iwd it applies when iwd next starts, so if it "
+                    "stays like this, restart iwd or reboot." if iwd else "If it stays like "
+                    "this, its connection profile sets its own MAC address.")))
             return result("in", value, self.about)
         if ours:
             return result("partial", "overridden", self.about,
                           why="The drop-in is there, but a file read after it sets "
-                              + ", ".join(missing) + " differently, so it is not in effect.")
+                              + ", ".join(k for k in missing if k != "AddressRandomization")
+                              + " differently, so it is not in effect.")
         if good:
-            return result("out", f"{len(good)} of {len(IDENTITY_WANTED)} set", self.about,
-                          why="Only some of the five settings are in place, so the host name "
+            return result("out", f"{len(good)} of {total} set", self.about,
+                          why=f"Only some of the {total} settings are in place, so the host name "
                               "or the hardware MAC address can still reach the network.")
         return result("out", "hardware MAC, host name sent", self.about,
                       why="Every network sees the hardware MAC address and the host name.")

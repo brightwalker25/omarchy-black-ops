@@ -338,6 +338,61 @@ def test_identity_adds_what_99_privacy_leaves_out(box, run):
     assert (conf / "99-privacy.conf").read_text() == NM_PRIVACY
 
 
+NM_IWD = "[device]\nwifi.backend=iwd\n"
+
+
+def iwd_installed(box):
+    box.write(box.root / "usr/lib/iwd/iwd", "", mode=0o755)
+
+
+def test_identity_under_iwd_sets_iwd_address_randomization(box, run):
+    iwd_installed(box)
+    box.write(box.etc / "NetworkManager/conf.d/wifi-backend.conf", NM_IWD)
+    main = box.etc / "iwd/main.conf"
+    assert rows(run("status"))["identity"]["value"] == "hardware MAC, host name sent"
+    box.clear_calls()
+    rep = run("on")
+    assert rows(rep)["identity"]["status"] == "ok", rows(rep)["identity"]
+    assert "[General]\n" in main.read_text()
+    assert "AddressRandomization=network\n" in main.read_text()
+    assert "systemctl try-restart iwd.service" in box.calls("systemctl")
+    run("off")
+    # iwd ships no main.conf, so the one Black Ops made goes with it.
+    assert not main.exists()
+    assert (box.etc / "iwd").is_dir()
+
+
+def test_the_drop_in_alone_under_iwd_reads_as_not_applied_yet(box, run):
+    iwd_installed(box)
+    box.write(box.etc / "NetworkManager/conf.d/wifi-backend.conf", NM_IWD)
+    run("on")
+    (box.etc / "iwd/main.conf").unlink()
+    r = rows(run("status"))["identity"]
+    assert r["value"] == "hardware MAC on Wi-Fi"
+    assert "iwd ignores" in r["why"]
+    assert rows(run("on"))["identity"]["status"] == "ok"
+    assert "AddressRandomization=network" in (box.etc / "iwd/main.conf").read_text()
+
+
+def test_identity_keeps_an_iwd_main_conf_of_your_own(box, run):
+    iwd_installed(box)
+    box.write(box.etc / "NetworkManager/conf.d/wifi-backend.conf", NM_IWD)
+    mine = "[General]\nEnableNetworkConfiguration=false\nAddressRandomization=once\n"
+    box.write(box.etc / "iwd/main.conf", mine)
+    rep = run("on")
+    assert rows(rep)["identity"]["status"] == "ok", rows(rep)["identity"]
+    text = (box.etc / "iwd/main.conf").read_text()
+    assert "#black-ops-was: AddressRandomization=once" in text
+    run("off")
+    assert (box.etc / "iwd/main.conf").read_text() == mine
+
+
+def test_identity_without_iwd_makes_no_iwd_folder(box, run):
+    box.write(box.etc / "NetworkManager/conf.d/99-privacy.conf", NM_PRIVACY)
+    run("on")
+    assert not (box.etc / "iwd").exists()
+
+
 def test_a_profile_that_sends_the_host_name_itself_is_amber(box, run):
     box.write(box.etc / "NetworkManager/conf.d/99-privacy.conf", NM_PRIVACY)
     run("on")
