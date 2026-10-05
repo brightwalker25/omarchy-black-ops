@@ -167,6 +167,8 @@ if [ "$UNINSTALL" -eq 1 ]; then
   echo "  /etc/chromium/policies/managed/black-ops.json"
   echo "  the lines marked black-ops in /etc/avahi/avahi-daemon.conf, /etc/fwupd/fwupd.conf"
   echo "  and /etc/bluetooth/main.conf"
+  echo "  the lines marked black-ops in /etc/iwd/main.conf, putting back a value of your"
+  echo "  own kept after '#black-ops-was: ', then: systemctl try-restart iwd.service"
   echo "  the Avahi daemon, if it was masked: systemctl unmask avahi-daemon.socket avahi-daemon.service"
   echo "  Omarchy's LocalSend rules, if they were closed: ufw allow 53317/tcp and 53317/udp"
   echo "  the LAN discovery route, if it was added, for each Ethernet and Wi-Fi connection:"

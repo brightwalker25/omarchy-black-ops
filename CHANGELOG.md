@@ -96,6 +96,9 @@ discovery row is optional and stays off until switched on by itself.
   out and put back on `identity-off`, and a `main.conf` that held nothing
   else is removed again. A drop-in from an earlier version reads as not
   applied yet under iwd, so switching on adds the rest.
+- The uninstaller's list of root-owned pieces to put back by hand now
+  includes the lines marked black-ops in `/etc/iwd/main.conf`, and how to
+  restore a value of your own that switching on kept aside.
 
 ## [0.4.0] - 2026-09-24
 
