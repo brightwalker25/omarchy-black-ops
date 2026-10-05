@@ -27,7 +27,7 @@ discovery row is optional and stays off until switched on by itself.
   were already off are adopted and left off on the way off, because turning
   them off was the user's choice in the app. Without that file, the row is
   not applicable.
-- Eleven hosts in the hosts block beside Claude Code's Datadog intake:
+- Thirteen hosts in the hosts block beside Claude Code's Datadog intake:
   Claude Code's Sentry crash reports (`o1158394.ingest.us.sentry.io`),
   Codex's Sentry crash reports (`o33249.ingest.us.sentry.io`), 1Password's
   telemetry and Sentry (`telemetry.1passwordservices.com` and
@@ -36,8 +36,10 @@ discovery row is optional and stays off until switched on by itself.
   Mozilla telemetry that Firefox-based browsers such as Zen send
   (`incoming.telemetry.mozilla.org`), and Google Analytics, which Obsidian
   and OnlyOffice carry (`google-analytics.com`, `www.google-analytics.com`,
-  `ssl.google-analytics.com` and `region1.google-analytics.com`). Pages
-  that use Google Analytics stop reporting your visits to it.
+  `ssl.google-analytics.com` and `region1.google-analytics.com`, and the
+  newer Google Analytics 4 collectors `analytics.google.com` and
+  `region1.analytics.google.com`). Pages that use Google Analytics stop
+  reporting your visits to it.
 - `ORT_DISABLE_TELEMETRY=1` in the opt-out variables, so onnxruntime, which
   local AI tools bring in, stops sending Microsoft telemetry.
 

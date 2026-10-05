@@ -120,6 +120,8 @@ TELEMETRY_HOSTS = (
     "www.google-analytics.com",               # and pages that embed it
     "ssl.google-analytics.com",
     "region1.google-analytics.com",
+    "analytics.google.com",                   # Google Analytics 4 collectors,
+    "region1.analytics.google.com",           # used by most pages since 2023
 )
 HERDR_HOSTS = (
     "herdr.dev",                              # herdr's version and manifest checks

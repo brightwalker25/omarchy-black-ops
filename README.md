@@ -313,8 +313,9 @@ hosts are:
 - `incoming.telemetry.mozilla.org`, the telemetry Firefox-based browsers
   such as Zen send;
 - `google-analytics.com`, `www.google-analytics.com`,
-  `ssl.google-analytics.com` and `region1.google-analytics.com`, Google
-  Analytics, which Obsidian and OnlyOffice carry.
+  `ssl.google-analytics.com`, `region1.google-analytics.com`,
+  `analytics.google.com` and `region1.analytics.google.com`, Google
+  Analytics, which Obsidian and OnlyOffice carry and many pages embed.
 
 Lines for the same hosts added by hand are moved into the block the first
 time it is switched on, so the file never holds them twice. Any other line
