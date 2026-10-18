@@ -12,6 +12,10 @@ discovery row is optional and stays off until switched on by itself.
 
 ### Added
 
+- Listen mode and the software watch know two more kinds of tracking:
+  the redirects podcast hosts put in front of episode files to log each
+  play (Podtrac, Chartable, OP3 and others), and AdsWizz's audio ad
+  tracking used by radio streams.
 - When the root helper is missing or out of date, the panel and the text
   output now give the exact command to run, with the installer's real path
   on that machine and the home folder written as `~`, such as

@@ -127,3 +127,22 @@ hosts = ["usage-ping.brave.com", "p3a.brave.com", "p3a-json.brave.com", "p2a.bra
          "p2a-json.brave.com", "star-randsrv.bsg.brave.com"]
 strings = ["usage-ping.brave.com", "p3a-json.brave.com", "p2a-json.brave.com", "star-randsrv.bsg.brave.com"]
 about = "Brave's daily usage ping and its privacy-preserving product analytics (P3A)."
+
+[[signature]]
+id = "podcast-play-counters"
+vendor = "Podcast measurement"
+kind = "analytics"
+hosts = ["dts.podtrac.com", "podtrac.com", "www.podtrac.com", "chrt.fm", "chtbl.com",
+         "pdst.fm", "op3.dev", "mgln.ai", "pfx.vpixl.com", "arttrk.com",
+         "prfx.byspotify.com", "verifi.podscribe.com", "tracking.swap.fm"]
+strings = ["dts.podtrac.com/redirect", "chrt.fm/track/", "chtbl.com/track/", "pdst.fm/e/",
+           "op3.dev/e/", "mgln.ai/e/", "arttrk.com/p/", "prfx.byspotify.com/e/"]
+about = "Redirects podcast hosts put in front of episode files to log each play and the listener's address before handing over the file."
+
+[[signature]]
+id = "adswizz"
+vendor = "AdsWizz"
+kind = "analytics"
+hosts = ["*.adswizz.com", "adswizz.com", "*.deliveryengine.adswizz.com"]
+strings = ["adswizz.com", "aw_0_1st."]
+about = "AdsWizz audio ad insertion and listener tracking, used by many radio streams and podcasts."
