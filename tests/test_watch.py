@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import REPO
+from conftest import REPO, load_module
 
 pytestmark = pytest.mark.skipif(not os.access("/usr/bin/grep", os.X_OK),
                                 reason="the scan needs GNU grep at /usr/bin/grep")
@@ -706,3 +706,12 @@ def test_a_failed_scan_is_recorded_and_the_row_says_so(box, capsys, monkeypatch)
     assert rep["watch"]["lastScanError"].startswith("OSError")
     assert rows(rep)["watch"]["status"] == "warn"
     assert "watch" in rep["attention"]
+
+
+def test_a_carried_review_says_carried_over_once():
+    watch = load_module("black_ops_watch_note", REPO / "lib" / "black_ops_watch.py")
+    once = "Carried over from an earlier version."
+    assert watch.carried_note("") == once
+    assert watch.carried_note("Checked by hand.") == f"{once} Checked by hand."
+    assert watch.carried_note(watch.carried_note("Checked by hand.")) == f"{once} Checked by hand."
+    assert watch.carried_note(" ".join([once] * 4)) == once

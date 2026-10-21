@@ -1448,6 +1448,18 @@ def snapshot_of(item):
             "strings": sorted(item.get("strings") or []), "version": item.get("version")}
 
 
+CARRIED = "Carried over from an earlier version."
+
+
+def carried_note(note):
+    """The note for a review carried over to a new item. The phrase is said
+    once, however many versions the review has been carried through."""
+    rest = str(note or "").strip()
+    while rest.startswith(CARRIED):
+        rest = rest[len(CARRIED):].strip()
+    return f"{CARRIED} {rest}"[:200].strip()
+
+
 def settle_reviews(ctx, api, st, now):
     """Keep reviews in step with a new scan. An item reviewed before keeps
     its review unless a later version of the program adds a finding the
@@ -1481,8 +1493,7 @@ def settle_reviews(ctx, api, st, now):
                     and snap.get("signature") == item["signature"] \
                     and strings <= set(snap.get("strings") or []):
                 reviews[rid] = dict(reviews[oid], at=now,
-                                    note=("Carried over from an earlier version. "
-                                          + str(reviews[oid].get("note") or ""))[:200].strip())
+                                    note=carried_note(reviews[oid].get("note")))
                 snaps[rid] = snapshot_of(item)
                 changed = True
                 break

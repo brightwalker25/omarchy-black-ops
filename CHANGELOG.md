@@ -89,6 +89,10 @@ discovery row is optional and stays off until switched on by itself.
 
 ### Fixed
 
+- A review carried over to a new version of a program says "Carried over
+  from an earlier version" once. It used to add the phrase again on every
+  update, so a review carried through four updates said it four times.
+
 - The network identity row now changes the Wi-Fi MAC address when
   NetworkManager uses iwd as its Wi-Fi backend. iwd chooses the address
   itself and ignores NetworkManager's `wifi.cloned-mac-address`, so Wi-Fi
