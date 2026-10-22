@@ -12,6 +12,10 @@ discovery row is optional and stays off until switched on by itself.
 
 ### Added
 
+- The README suggests a way to review the software watch's findings once for
+  several machines: verdicts kept in a private repository, matched on program
+  and signature, and applied with a short script.
+
 - Listen mode and the software watch know two more kinds of tracking:
   the redirects podcast hosts put in front of episode files to log each
   play (Podtrac, Chartable, OP3 and others), and AdsWizz's audio ad

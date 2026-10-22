@@ -533,6 +533,37 @@ program that connects to a fixed address by that address only. Details are
 in [docs/listen.md](docs/listen.md), and the panel is described in
 [docs/panel.md](docs/panel.md).
 
+### Several machines
+
+With the same software on more than one machine, the watch flags the same
+programs on each, and each needs the same review. One way to review them once
+is to keep your verdicts in a private repository that every machine pulls, and
+apply them with a short script. Keep that repository private: the list records
+which programs you run and how you have locked each one down.
+
+Match on program and signature, not on the item id. The id is hashed from the
+file's path, which differs between machines for anything installed under a
+home folder or in a versioned folder. A list of tab-separated lines, `program`,
+`signature`, `allow` or `false-positive`, and a note, is enough:
+
+```bash
+# reviews.tsv:  gh<TAB>watch-kill-switch<TAB>allow<TAB>Telemetry is off in gh's config
+black-ops watch list --json | jq -r '.[] | select(.reviewed | not) | [.id, .program, .signature] | @tsv' |
+while IFS=$'\t' read -r id program signature; do
+  line=$(awk -F'\t' -v p="$program" -v s="$signature" '$1 == p && $2 == s' reviews.tsv)
+  if [ -z "$line" ]; then echo "needs a review: $program $signature"; continue; fi
+  IFS=$'\t' read -r _ _ verdict note <<<"$line"
+  black-ops review "$id" "$verdict" --note "$note"
+done
+```
+
+That is bash; run it with `bash`, with `black-ops` meaning this plugin's
+`bin/black-ops`. A daily user timer that pulls the repository and runs it
+keeps every machine in step, and anything it prints is new and worth a real
+look. Write the reason into each note. Most verdicts hold only while a
+protection holds, such as a host in the hosts block or an opt-out variable,
+so turn the same protections on everywhere before applying the list.
+
 ## Rows from other stacks
 
 Other stacks, such as Nightloom, can show their own protections in the panel
