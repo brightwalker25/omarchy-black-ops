@@ -243,8 +243,8 @@ def fixtures():
             error="The root helper installed on this machine is from version 0.3.0, not from this version of Black Ops, so the rows that need root are left as they are. Open a terminal and run sudo ~/.config/omarchy/plugins/brightwalker25.black-ops/bin/black-ops-install to install this version's helper, then switch Black Ops on again.")
     set_row(rep, "debuginfod", status="warn", inPlace=False, value="on",
             why="Not put in place yet. Switch on again to apply it.")
-    rep["rows"].append(row("nightloom/ollama-block", "ollama.com block", value="blocked",
-                           registered=True, source="nightloom", switchable=False, managed=None))
+    rep["rows"].append(row("local-ai/ollama-block", "ollama.com block", value="blocked",
+                           registered=True, source="local-ai", switchable=False, managed=None))
     out["phase1"] = rep
 
     # Extensions that failed to load: their rows are missing and the

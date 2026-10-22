@@ -21,29 +21,29 @@ from conftest import (BLOCK_01, BLOCK_NOW, DATADOG, HOSTS_01, HOSTS_01_OLLAMA, S
 PROTON = "proton-crash"
 KEPT = {"hosts", "dns", "weather", "agents", "claude"}
 REMOVED = ("onnx", "ollama-offline", "ollama-block", "openwebui", "proton")
-NIGHTLOOM_LINES = """\
-# onnxruntime telemetry and ComfyUI Sentry, blocked for Nightloom
+AI_STACK_LINES = """\
+# onnxruntime telemetry and ComfyUI Sentry, blocked for local AI tools
 0.0.0.0 mobile.events.data.microsoft.com
 :: mobile.events.data.microsoft.com
 0.0.0.0 o4507954455314432.ingest.us.sentry.io
 :: o4507954455314432.ingest.us.sentry.io
 """
 OLLAMA_LINES = """\
-# ollama.com, blocked for Nightloom
+# ollama.com, blocked for local AI tools
 0.0.0.0 ollama.com
 :: ollama.com
 """
-NIGHTLOOM_HOSTS_LINES = [f"{a} {h}" for h in ("mobile.events.data.microsoft.com",
+AI_STACK_HOSTS_LINES = [f"{a} {h}" for h in ("mobile.events.data.microsoft.com",
                                                "o4507954455314432.ingest.us.sentry.io")
                          for a in ("0.0.0.0", "::")]
 
 
-def nightloom_missing_hosts_lines(text):
-    """The same test Nightloom's setup makes in missing_hosts_lines(): a
+def ai_stack_missing_hosts_lines(text):
+    """The same test the AI stack's setup makes in missing_hosts_lines(): a
     line counts wherever it is in the file, comments aside."""
     lines = [line.split("#", 1)[0].split() for line in text.splitlines()]
     have = {(w[0], host) for w in lines if len(w) > 1 for host in w[1:]}
-    return [line for line in NIGHTLOOM_HOSTS_LINES if tuple(line.split()) not in have]
+    return [line for line in AI_STACK_HOSTS_LINES if tuple(line.split()) not in have]
 
 
 def rows(rep):
@@ -151,7 +151,7 @@ def test_status_says_the_block_needs_tidying(upgraded, run):
     assert r["status"] == "ok" and r["value"] == "blocked, block to tidy"
     assert "earlier version" in r["detail"]
     run("on")
-    assert upgraded.hosts.read_text() == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_NOW
+    assert upgraded.hosts.read_text() == STOCK_HOSTS + "\n" + AI_STACK_LINES + "\n" + BLOCK_NOW
 
 
 def test_on_hands_the_other_hosts_over_without_unblocking_them(upgraded, run):
@@ -159,8 +159,8 @@ def test_on_hands_the_other_hosts_over_without_unblocking_them(upgraded, run):
     rep = run("on")
     assert upgraded.helper_verbs() == ["hosts-on"]
     text = upgraded.hosts.read_text()
-    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_NOW
-    assert nightloom_missing_hosts_lines(text) == []
+    assert text == STOCK_HOSTS + "\n" + AI_STACK_LINES + "\n" + BLOCK_NOW
+    assert ai_stack_missing_hosts_lines(text) == []
     assert rows(rep)["hosts"]["value"] == "blocked"
     assert rep["overall"] == "ok", rep
     # The VPN app's crash reports, off since 0.1, are adopted, not rewritten.
@@ -170,14 +170,14 @@ def test_on_hands_the_other_hosts_over_without_unblocking_them(upgraded, run):
     assert not_black_opss(upgraded) == kept_before
 
 
-def test_off_after_the_upgrade_keeps_what_now_belongs_to_nightloom(upgraded, run):
+def test_off_after_the_upgrade_keeps_what_now_belongs_to_the_ai_stack(upgraded, run):
     kept_before = not_black_opss(upgraded)
     run("on")
     rep = run("off")
     assert rep["overall"] == "off", rep
     text = upgraded.hosts.read_text()
-    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES
-    assert nightloom_missing_hosts_lines(text) == []
+    assert text == STOCK_HOSTS + "\n" + AI_STACK_LINES
+    assert ai_stack_missing_hosts_lines(text) == []
     assert not upgraded.dns_dropin.exists()
     assert not_black_opss(upgraded) == kept_before
     # The VPN app's crash reports were already off, so on adopted them, and
@@ -191,8 +191,8 @@ def test_off_straight_after_the_upgrade_is_just_as_safe(upgraded, run):
     run("off")
     assert sorted(upgraded.helper_verbs()) == ["dns-off", "hosts-off"]
     text = upgraded.hosts.read_text()
-    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES
-    assert nightloom_missing_hosts_lines(text) == []
+    assert text == STOCK_HOSTS + "\n" + AI_STACK_LINES
+    assert ai_stack_missing_hosts_lines(text) == []
     assert not_black_opss(upgraded) == kept_before
 
 
@@ -200,10 +200,10 @@ def test_an_ollama_block_moves_out_and_stays(sandbox, run):
     sandbox.machine_01(ollama_block=True)
     run("on")
     text = sandbox.hosts.read_text()
-    assert text == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + OLLAMA_LINES + "\n" + BLOCK_NOW
+    assert text == STOCK_HOSTS + "\n" + AI_STACK_LINES + OLLAMA_LINES + "\n" + BLOCK_NOW
     assert "ollama-block" not in sandbox.state()["rows"]
     run("off")
-    assert sandbox.hosts.read_text() == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + OLLAMA_LINES
+    assert sandbox.hosts.read_text() == STOCK_HOSTS + "\n" + AI_STACK_LINES + OLLAMA_LINES
 
 
 # ------------------------------------------------------------ an old helper
@@ -235,7 +235,7 @@ def test_an_old_helper_is_reported_and_never_run(sandbox, run):
     assert rep["headline"] == "On, but the root helper needs reinstalling"
     assert rows(rep)["hosts"]["error"] == rep["helperNote"]
     # Neither on nor off runs it: 0.1's hosts-off would unblock the hosts
-    # that now belong to Nightloom.
+    # that now belong to the AI stack.
     run("on")
     rep = run("off")
     assert sandbox.calls("sudo") == []

@@ -55,7 +55,7 @@ STOCK_HOSTS = """\
 # A hosts file with telemetry blocks added by hand before the plugin existed,
 # as on the machine it was first written for.
 HAND_HOSTS = STOCK_HOSTS + """
-# onnxruntime telemetry (1DS), blocked 2026-09-23 for Nightloom
+# onnxruntime telemetry (1DS), blocked 2026-09-23 for local AI tools
 0.0.0.0 mobile.events.data.microsoft.com
 :: mobile.events.data.microsoft.com
 # ComfyUI frontend Sentry and Claude Code Datadog telemetry, blocked 2026-09-23

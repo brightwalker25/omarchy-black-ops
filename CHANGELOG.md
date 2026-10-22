@@ -75,8 +75,8 @@ discovery row is optional and stays off until switched on by itself.
 - Black Ops no longer covers only what stock Omarchy ships. The rule is now
   that unless telemetry is absolutely essential for a program to work, it is
   barred, and that applies to apps you install yourself too. This reverses
-  the scope set in 0.2.0. The hosts Nightloom blocks for itself stay
-  Nightloom's.
+  the scope set in 0.2.0. Hosts that another stack blocks for
+  itself stay that stack's.
 - The hosts row is now called "Telemetry hosts". It applies on every
   machine, rather than reading as not applicable until Claude Code is set
   up, since the programs it covers can be installed at any time. A block

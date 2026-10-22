@@ -136,13 +136,13 @@ BLOCK_NOTE = "# Managed by the Black Ops bar plugin. Switch it off there rather 
 # Hosts that version 0.1 kept inside the block and that now belong to the
 # apps they concern. Their lines are moved out of the block, just above it,
 # as plain lines under these comments, so they stay blocked and Black Ops no
-# longer removes them. Nightloom's setup recognises plain lines like these as
-# already in place. Any other line found inside the block is moved out too,
+# longer removes them. A stack that blocks the same hosts itself sees plain lines
+# like these as already in place. Any other line found inside the block is moved out too,
 # without a comment, rather than lost.
 HANDED_OVER = (
-    ("# onnxruntime telemetry and ComfyUI Sentry, blocked for Nightloom",
+    ("# onnxruntime telemetry and ComfyUI Sentry, blocked for local AI tools",
      ("mobile.events.data.microsoft.com", "o4507954455314432.ingest.us.sentry.io")),
-    ("# ollama.com, blocked for Nightloom",
+    ("# ollama.com, blocked for local AI tools",
      ("ollama.com",)),
 )
 

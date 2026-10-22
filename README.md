@@ -191,8 +191,8 @@ barred, and that holds for apps you install yourself as well as for the
 ones Omarchy ships. Telemetry a program truly needs in order to work is left
 alone. Other stacks can still show protections of their own in the
 panel through [rows.d](#rows-from-other-stacks), where they only report, and
-what they set up stays theirs: the hosts Nightloom blocks, such as
-onnxruntime's Microsoft endpoint, are left to Nightloom.
+what they set up stays theirs: hosts that a local AI stack blocks for
+itself, such as onnxruntime's Microsoft endpoint, are left to that stack.
 
 **What it does not solve.** It does not inspect traffic, so it cannot see a
 new phone-home that nobody has found yet; the watchdog only confirms that the
@@ -566,12 +566,12 @@ so turn the same protections on everywhere before applying the list.
 
 ## Rows from other stacks
 
-Other stacks, such as Nightloom, can show their own protections in the panel
-by writing a JSON file to `~/.config/omarchy-black-ops/rows.d/`. Those rows
-only report: they have no switch, their checks are declarative, and a file
-there can never make Black Ops run a program or send anything. A file that
-anyone else can write, or that does not follow the format, is skipped and
-named in the panel. The format is in [docs/contract.md](docs/contract.md),
+Other stacks, such as a local AI setup, can show their own protections in
+the panel by writing a JSON file to `~/.config/omarchy-black-ops/rows.d/`.
+Those rows only report: they have no switch, their checks are declarative,
+and a file there can never make Black Ops run a program or send anything. A
+file that anyone else can write, or that does not follow the format, is
+skipped and named in the panel. The format is in [docs/contract.md](docs/contract.md),
 section 10.
 
 ## Upgrading from 0.4

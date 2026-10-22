@@ -1348,9 +1348,9 @@ def test_an_update_with_everything_holding_is_recorded_at_once(box, run):
 
 # ------------------------------------------------------------------ rows.d
 
-NIGHTLOOM = {
+AI_STACK = {
     "schema": 1,
-    "stack": "nightloom",
+    "stack": "local-ai",
     "rows": [
         {"id": "ollama-block", "label": "ollama.com block",
          "about": "Sinks ollama.com in /etc/hosts.",
@@ -1377,57 +1377,57 @@ def rows_d(box, name, doc, mode=0o644):
 
 
 def test_rows_d_rows_report_without_a_switch(box, run):
-    rows_d(box, "nightloom.json", NIGHTLOOM)
+    rows_d(box, "local-ai.json", AI_STACK)
     box.write(box.home / "AI/comfy.json", '{"a": {"b": false}}')
     box.write(box.home / "AI/c.toml", "[x]\ny = 1\n")
     box.write(box.hosts, STOCK_HOSTS + "0.0.0.0 ollama.com\n:: ollama.com\n")
     rep = run("on")
     r = rows(rep)
-    assert r["nightloom/ollama-block"]["status"] == "ok"
-    assert r["nightloom/ollama-block"]["registered"] is True
-    assert r["nightloom/ollama-block"]["switchable"] is False
-    assert r["nightloom/comfy"]["status"] == "ok"
-    no_cloud = r["nightloom/no-cloud"]
+    assert r["local-ai/ollama-block"]["status"] == "ok"
+    assert r["local-ai/ollama-block"]["registered"] is True
+    assert r["local-ai/ollama-block"]["switchable"] is False
+    assert r["local-ai/comfy"]["status"] == "ok"
+    no_cloud = r["local-ai/no-cloud"]
     assert no_cloud["status"] == "warn" and no_cloud["colour"] == "amber"
-    assert "Put it back in nightloom." in no_cloud["why"]
-    assert run("row", "nightloom/no-cloud", "on")["error"].startswith("Rows other stacks")
-    assert "nightloom/no-cloud" not in box.state()["rows"]
+    assert "Put it back in local-ai." in no_cloud["why"]
+    assert run("row", "local-ai/no-cloud", "on")["error"].startswith("Rows other stacks")
+    assert "local-ai/no-cloud" not in box.state()["rows"]
 
 
 def test_rows_d_rows_are_grey_while_off(box, run):
-    rows_d(box, "nightloom.json", NIGHTLOOM)
+    rows_d(box, "local-ai.json", AI_STACK)
     rep = run("status")
     assert all(r["colour"] == "grey" for r in rep["rows"] if r["registered"])
 
 
 @pytest.mark.parametrize("doc,why", [
     ("not json", "not valid JSON"),
-    (dict(NIGHTLOOM, schema=2), "schema must be 1"),
-    (dict(NIGHTLOOM, stack="other"), "matching the file name"),
-    (dict(NIGHTLOOM, rows=[{"id": "x", "label": "X", "check": {"command": ["curl", "x"]}}]),
+    (dict(AI_STACK, schema=2), "schema must be 1"),
+    (dict(AI_STACK, stack="other"), "matching the file name"),
+    (dict(AI_STACK, rows=[{"id": "x", "label": "X", "check": {"command": ["curl", "x"]}}]),
      "exactly one of"),
-    (dict(NIGHTLOOM, rows=[{"id": "x", "label": "X", "check": {"file": "relative", "exists": True}}]),
+    (dict(AI_STACK, rows=[{"id": "x", "label": "X", "check": {"file": "relative", "exists": True}}]),
      "must start with"),
-    (dict(NIGHTLOOM, rows=[{"id": "x", "label": "X", "check": {"file": "~/../etc", "exists": True}}]),
+    (dict(AI_STACK, rows=[{"id": "x", "label": "X", "check": {"file": "~/../etc", "exists": True}}]),
      "may not contain"),
 ])
 def test_rows_d_files_that_are_not_valid_are_skipped(box, run, doc, why):
-    rows_d(box, "nightloom.json", doc)
+    rows_d(box, "local-ai.json", doc)
     rep = run("status")
     assert not any(r["registered"] for r in rep["rows"])
-    assert rep["rowsD"]["skipped"][0]["file"] == "nightloom.json"
+    assert rep["rowsD"]["skipped"][0]["file"] == "local-ai.json"
     assert why in rep["rowsD"]["skipped"][0]["why"]
 
 
 def test_rows_d_files_others_can_write_are_skipped(box, run):
-    rows_d(box, "nightloom.json", NIGHTLOOM, mode=0o666)
+    rows_d(box, "local-ai.json", AI_STACK, mode=0o666)
     rep = run("status")
     assert not any(r["registered"] for r in rep["rows"])
     assert "writable by others" in rep["rowsD"]["skipped"][0]["why"]
 
 
 def test_rows_d_cannot_take_a_black_ops_name(box, run):
-    rows_d(box, "dns.json", dict(NIGHTLOOM, stack="dns"))
+    rows_d(box, "dns.json", dict(AI_STACK, stack="dns"))
     assert "clashes" in run("status")["rowsD"]["skipped"][0]["why"]
 
 

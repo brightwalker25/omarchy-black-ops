@@ -14,8 +14,8 @@ from conftest import (BLOCK_02, BLOCK_NOW, DATADOG, HAND_HOSTS, HOSTS_01, HOSTS_
 # them, so after the installer has run once more they stop working.
 REMOVED_VERBS = ("ollama-block-on", "ollama-block-off", "ollama-dropin-on",
                  "ollama-dropin-off", "onnx-lock", "onnx-unlock")
-NIGHTLOOM_LINES = """\
-# onnxruntime telemetry and ComfyUI Sentry, blocked for Nightloom
+AI_STACK_LINES = """\
+# onnxruntime telemetry and ComfyUI Sentry, blocked for local AI tools
 0.0.0.0 mobile.events.data.microsoft.com
 :: mobile.events.data.microsoft.com
 0.0.0.0 o4507954455314432.ingest.us.sentry.io
@@ -148,7 +148,7 @@ def test_hosts_off_leaves_the_stock_file(helper):
 
 def test_hosts_on_rewrites_a_01_block_to_hold_only_the_telemetry_hosts(helper):
     out = helper.edit_hosts(HOSTS_01, True)
-    assert out == STOCK_HOSTS + "\n" + NIGHTLOOM_LINES + "\n" + BLOCK_NOW
+    assert out == STOCK_HOSTS + "\n" + AI_STACK_LINES + "\n" + BLOCK_NOW
     _, inner = helper.split_block(out)
     assert helper.block_hosts(inner) == set(TELEMETRY_HOSTS)
 
@@ -172,8 +172,8 @@ def test_switching_herdr_keeps_a_block_from_an_earlier_version(helper, herdr):
 
 def test_ollama_lines_in_a_01_block_move_out_as_well(helper):
     out = helper.edit_hosts(HOSTS_01_OLLAMA, True)
-    assert out == (STOCK_HOSTS + "\n" + NIGHTLOOM_LINES +
-                   "# ollama.com, blocked for Nightloom\n0.0.0.0 ollama.com\n:: ollama.com\n"
+    assert out == (STOCK_HOSTS + "\n" + AI_STACK_LINES +
+                   "# ollama.com, blocked for local AI tools\n0.0.0.0 ollama.com\n:: ollama.com\n"
                    "\n" + BLOCK_NOW)
 
 
@@ -185,7 +185,7 @@ def test_hosts_off_never_removes_the_microsoft_or_sentry_lines(helper, start):
         out = helper.edit_hosts(text, False)
         assert "# BEGIN black-ops" not in out and "# END black-ops" not in out
         assert not any(h in out for h in TELEMETRY_HOSTS)
-        assert out.startswith(STOCK_HOSTS + "\n" + NIGHTLOOM_LINES)
+        assert out.startswith(STOCK_HOSTS + "\n" + AI_STACK_LINES)
         for host in ("mobile.events.data.microsoft.com", "o4507954455314432.ingest.us.sentry.io"):
             assert f"0.0.0.0 {host}\n" in out and f":: {host}\n" in out
         assert ("ollama.com" in out) == (start is HOSTS_01_OLLAMA)
@@ -193,13 +193,13 @@ def test_hosts_off_never_removes_the_microsoft_or_sentry_lines(helper, start):
 
 
 def test_hosts_off_keeps_plain_microsoft_and_sentry_lines(helper):
-    text = STOCK_HOSTS + "\n" + NIGHTLOOM_LINES
+    text = STOCK_HOSTS + "\n" + AI_STACK_LINES
     assert helper.edit_hosts(text, False) == text
     assert helper.edit_hosts(helper.edit_hosts(text, True), False) == text
 
 
 def test_lines_already_outside_the_block_are_not_repeated(helper):
-    # Nightloom's setup appended its own plain lines after 0.1 had put the
+    # The AI stack's setup appended its own plain lines after 0.1 had put the
     # same hosts in the block.
     text = HOSTS_01 + "0.0.0.0 mobile.events.data.microsoft.com\n:: mobile.events.data.microsoft.com\n"
     out = helper.edit_hosts(text, True)

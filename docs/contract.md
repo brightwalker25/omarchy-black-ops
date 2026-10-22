@@ -523,7 +523,7 @@ or when anything below does not hold.
 ```json
 {
   "schema": 1,
-  "stack": "nightloom",
+  "stack": "local-ai",
   "rows": [
     {
       "id": "ollama-block",

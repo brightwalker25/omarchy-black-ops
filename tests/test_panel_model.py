@@ -111,7 +111,7 @@ def test_phase_one_states_are_named():
     assert "DNS fallback servers has slipped" in m["tooltip"]
     assert "Debug symbol downloads is not applied yet" in m["tooltip"]
     assert "root helper needs reinstalling" in m["tooltip"]
-    assert m["rowStatus"]["nightloom/ollama-block"] == "ok"
+    assert m["rowStatus"]["local-ai/ollama-block"] == "ok"
 
 
 def test_missing_extensions_leave_the_rest_working():
