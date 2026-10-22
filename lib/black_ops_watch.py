@@ -2103,7 +2103,7 @@ def cli_scan(ctx, api, rest):
             print(f"black-ops watch: the scan failed: {st['lastScanError']}", file=sys.stderr)
             return 1
     # Bring the status and summary.json up to date for the bar and for
-    # Security Scan.
+    # Spycatcher.
     with contextlib.suppress(Exception):
         api.current_report(ctx)
     if not quiet:
@@ -2216,7 +2216,7 @@ def cli_review(ctx, api, rest):
     write_reviews(ctx, api, reviews)
     save_store(ctx, api, st)
     # The report is always brought up to date, so summary.json, which
-    # Security Scan reads, follows the review at once.
+    # Spycatcher reads, follows the review at once.
     rep = api.current_report(ctx)
     if status_out:
         print(json.dumps(rep))
@@ -2265,7 +2265,7 @@ def cli_review_all(ctx, api, args, status_out):
     write_reviews(ctx, api, reviews)
     save_store(ctx, api, st)
     # The report is always brought up to date, so summary.json, which
-    # Security Scan reads, follows the review at once.
+    # Spycatcher reads, follows the review at once.
     rep = api.current_report(ctx)
     if status_out:
         print(json.dumps(rep))

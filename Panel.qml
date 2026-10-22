@@ -47,7 +47,7 @@ Panel {
   readonly property color okColor: "#3fb950"
   readonly property color warnColor: "#d29922"
   // Red is kept for one thing: listen mode saw a program contact a telemetry
-  // host. It is the red Security Scan uses.
+  // host. It is the red Spycatcher uses.
   readonly property color leakColor: "#f85149"
 
   readonly property int refreshMs: Math.max(1, Number(setting("refreshMinutes", 10))) * 60000
@@ -401,7 +401,7 @@ Panel {
         anchors.left: rowLabel.right
         anchors.leftMargin: Style.spacing.xs
         anchors.verticalCenter: parent.verticalCenter
-        // nf-md-chevron_down and nf-md-chevron_right, as in Security Scan.
+        // nf-md-chevron_down and nf-md-chevron_right, as in Spycatcher.
         text: prow.expanded ? "󰅀" : "󰅂"
         color: root.dim
         font.family: root.fontFamily

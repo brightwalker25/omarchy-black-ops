@@ -196,7 +196,7 @@ Under `~/.local/state/black-ops`, readable only by you:
 | `watch.json` | Flagged items with their evidence, notes, and the last scan |
 | `reviewed.toml` | Your reviews |
 
-`summary.json`, which Security Scan reads, holds only the number of flagged
+`summary.json`, which Spycatcher reads, holds only the number of flagged
 and unreviewed items and the time of the last scan. Switching the row off
 keeps these files, so your reviews survive. To remove them:
 

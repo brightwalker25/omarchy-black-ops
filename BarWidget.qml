@@ -19,7 +19,7 @@ import qs.Ui
 //   amber. The colours are fixed rather than taken from the theme, for the
 //   reason the panel gives.
 // - On, and listen mode saw a program contact a telemetry host: the same
-//   scope in red, the red Security Scan uses. Nothing else is red.
+//   scope in red, the red Spycatcher uses. Nothing else is red.
 // - Off: an empty scope, dimmed the way the bar dims anything inactive, so the
 //   difference reads from the shape as well as the colour.
 //
@@ -31,7 +31,7 @@ BarWidget {
 
   // nf-md-crosshairs_gps and nf-md-crosshairs, from JetBrainsMono Nerd Font,
   // which is what the bar uses. A scope rather than a lock, so it cannot be
-  // mistaken for Security Scan's lock, which usually sits beside it.
+  // mistaken for Spycatcher's lock, which usually sits beside it.
   readonly property string glyphOn: "󰆤"
   readonly property string glyphOff: "󰆣"
 

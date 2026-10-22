@@ -10,7 +10,7 @@ built against this file at the same time:
   `omarchy-black-ops-listen`, its RAM store and three helper verbs.
 - C, the panel: the watch and listen rows and the review list in
   `Panel.qml`, and anything the bar needs in `BarWidget.qml`.
-- D, Security Scan: a Privacy section that reads
+- D, Spycatcher: a Privacy section that reads
   `~/.local/state/black-ops/summary.json`.
 
 Everything below is fixed. A change to a field, a path, a verb or a format
@@ -57,7 +57,7 @@ Where this file says "may", the choice is the builder's.
 | `bin/black-ops-install` | A edits only between the `# ---- watch` markers, B only between the `# ---- listen` markers, and B adds its three verbs to `VERBS` |
 | `data/signatures.toml` | read by A and B; entries added through the coordinator |
 | `Panel.qml`, `BarWidget.qml` | C |
-| Security Scan repository | D |
+| Spycatcher repository | D |
 | `bin/black-ops` | nobody in phase 2; ask the coordinator for a change to the core |
 | `tests/test_watch.py`, `tests/test_listen.py`, `tests/test_panel_contract.py` | A, B, C respectively |
 
@@ -627,7 +627,7 @@ new state at once.
 - The bar: green, amber, red and grey follow `overall` exactly as
   `BarWidget.qml` does in 0.3.0. Nothing else may make the lock red.
 
-## 14. Security Scan (D)
+## 14. Spycatcher (D)
 
 Read `summary.json` only. Do not run `bin/black-ops`, and do not read any
 other Black Ops file. Show counts, never names. Suggested mapping, subject

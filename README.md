@@ -203,7 +203,7 @@ was switched on cannot be recalled.
 
 ## The bar and the panel
 
-The glyph is a rifle scope, so it cannot be mistaken for Security Scan's
+The glyph is a rifle scope, so it cannot be mistaken for Spycatcher's
 lock beside it. Its colours are fixed rather than taken
 from the theme, and match the lights in the panel. Green is on and holding,
 amber is a real problem, grey is off or not applicable, and red is kept for
@@ -638,7 +638,7 @@ The plugin is not in any registry yet. From a clone at
    ```
 
    `--before <id>`, `--after <id>` and `--index <n>` choose the position, for
-   example `--before brightwalker25.security-scan`.
+   example `--before brightwalker25.spycatcher`.
 
 3. Run the privileged installer once:
 
@@ -743,7 +743,7 @@ which developer tools it changed. It never records a coordinate or the
 contents of a file, and it is readable only by you.
 
 It also writes `~/.local/state/black-ops/summary.json`, readable only by
-you, for tools such as Security Scan. That file holds counts and states and
+you, for tools such as Spycatcher. That file holds counts and states and
 nothing else: no host, program, path or file name.
 
 Two things outside the plugin do record something. sudo writes each helper

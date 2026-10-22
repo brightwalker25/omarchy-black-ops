@@ -86,6 +86,9 @@ discovery row is optional and stays off until switched on by itself.
   instead of rounded to two decimal places (about 1.1 km north to south and
   less east to west). A location rounded the old way shows as precise until
   the row is applied again.
+- Security Scan is now called Spycatcher, so the README, the comments and the
+  phase 2 contract use the new name, and the README's `--before` example
+  names `brightwalker25.spycatcher`.
 
 ### Fixed
 

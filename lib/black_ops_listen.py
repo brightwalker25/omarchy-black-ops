@@ -386,7 +386,7 @@ def cli(ctx, api, argv):
         print(f"black-ops listen purge: {exc}", file=sys.stderr)
         return 1
     # The report is always brought up to date, so summary.json, which
-    # Security Scan reads, stops counting the purged contacts at once.
+    # Spycatcher reads, stops counting the purged contacts at once.
     rep = api.current_report(ctx)
     if args.status:
         print(json.dumps(rep))

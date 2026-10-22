@@ -3528,7 +3528,7 @@ def status(ctx, st):
 
 
 def summary(rep):
-    """The counts other tools may read, such as Security Scan's Privacy
+    """The counts other tools may read, such as Spycatcher's Privacy
     section. Counts and states only: no host, program, path or file name."""
     rows = [r for r in rep["rows"] if not r["registered"]]
     count = lambda pred: sum(1 for r in rows if pred(r))
