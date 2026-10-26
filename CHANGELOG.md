@@ -12,6 +12,13 @@ discovery row is optional and stays off until switched on by itself.
 
 ### Added
 
+- When Spycatcher 0.6.0 or later is installed, the installer records the
+  files it writes as root with `spycatcher-report --record`, so Spycatcher's
+  file integrity check grades them as the installer's instead of listing
+  them to confirm after every install. Only a copy of `spycatcher-report`
+  that root owns and only root can write is run, and nothing else depends
+  on it.
+
 - The README suggests a way to review the software watch's findings once for
   several machines: verdicts kept in a private repository, matched on program
   and signature, and applied with a short script.

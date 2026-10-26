@@ -346,6 +346,18 @@ if [ "$DRY" -eq 1 ]; then
   echo "Dry run: nothing was changed."
   exit 0
 fi
+
+# Spycatcher, when installed, records the files this run wrote as root, so
+# its next file integrity check grades them as this installer's rather than
+# as changes to confirm. Only a copy that root owns and only root can write
+# is run. Nothing here depends on it.
+SPYCATCHER_REPORT=/usr/local/bin/spycatcher-report
+if [ -n "$(find "$SPYCATCHER_REPORT" -maxdepth 0 -type f -user root ! -perm /022 2>/dev/null)" ]; then
+  "$SPYCATCHER_REPORT" --record "$HELPER" "$LIBDIR/watch-spool" "$LIBDIR/listen" \
+    "$LIBDIR/signatures.toml" /etc/pacman.d/hooks/90-omarchy-black-ops-watch.hook \
+    "$LISTEN_CONF" "$LISTEN_UNIT" "$SUDOERS" --by black-ops-install >/dev/null 2>&1 ||
+    echo "  (Spycatcher did not record these files; it will list them to confirm)"
+fi
 echo "Installed helper $("$HELPER" version | sed 's/^version: //'). $TARGET_USER can now run"
 echo "$HELPER with these verbs, and no others:"
 printf '  %s\n' "${VERBS[@]}"

@@ -736,6 +736,15 @@ To see the rule before installing:
 ~/Work/omarchy-black-ops/bin/black-ops-install --print-sudoers (whoami)
 ```
 
+If Spycatcher 0.6.0 or later is installed, the installer finishes by
+recording what it wrote as root (the helper and its scripts, the pacman
+hook, listen mode's settings and service, and the sudoers rule) with
+`spycatcher-report --record`. Spycatcher's next file integrity check then
+grades those files as the installer's write, while they still hold what was
+recorded, instead of listing them for you to confirm after every install.
+The installer runs `spycatcher-report` only when root owns it and nobody
+else can write it, and installs the same way without it.
+
 ## Uninstalling
 
 Switch Black Ops off in the panel first if you want the machine returned to
